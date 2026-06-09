@@ -16,7 +16,7 @@ export const resolvers = {
   },
 
   User: {
-    social_accounts: (user) => {
+    socialAccounts: (user) => {
       const username = user.username || "unknown";
       return [
         {
@@ -29,7 +29,7 @@ export const resolvers = {
           __typename: "GitHubAccount",
           url: `https://github.com/${username}`,
           handle: username,
-          repo_count: 42,
+          repoCount: 42,
         },
       ];
     },

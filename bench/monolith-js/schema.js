@@ -13,7 +13,7 @@ export const typeDefs = `
   type GitHubAccount implements SocialAccount {
     url: String!
     handle: String!
-    repo_count: Int!
+    repoCount: Int!
   }
 
   type User {
@@ -21,7 +21,7 @@ export const typeDefs = `
     name: String
     username: String
     birthday: Int
-    social_accounts: [SocialAccount!]!
+    socialAccounts: [SocialAccount!]!
     reviews: [Review!]!
   }
 
