@@ -173,15 +173,13 @@ struct EquivalentQueryFamily {
 
 #[derive(Debug, Clone)]
 enum RootFieldIntent {
-    Me,
-    User { id: String },
+    Rendered(String),
 }
 
 impl RootFieldIntent {
     fn render(&self) -> String {
         match self {
-            Self::Me => "me".to_string(),
-            Self::User { id } => format!("user(id: \"{}\")", id),
+            Self::Rendered(field) => field.clone(),
         }
     }
 }
@@ -194,19 +192,29 @@ struct SemanticDirectiveIntent {
 
 #[derive(Debug, Clone)]
 struct SemanticSelectionIntent {
-    field_name: &'static str,
+    field_name: String,
 }
 
 #[derive(Debug, Clone)]
 struct EquivalentSemanticIntent {
     operation_name: String,
     root_field: RootFieldIntent,
-    target_field: &'static str,
-    abstract_type: &'static str,
-    concrete_type: &'static str,
+    target_field: String,
+    abstract_type: String,
+    concrete_type: String,
     shared_fields: Vec<SemanticSelectionIntent>,
     concrete_fields: Vec<SemanticSelectionIntent>,
     directives: SemanticDirectiveIntent,
+}
+
+#[derive(Debug, Clone)]
+struct EquivalentFamilyCandidate {
+    root_field: RootFieldIntent,
+    target_field: String,
+    abstract_type: String,
+    concrete_type: String,
+    shared_fields: Vec<String>,
+    concrete_fields: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -806,11 +814,7 @@ impl<'a> EquivalentQueryFamilyGenerator<'a> {
     }
 
     fn generate(&self, family_kind: EquivalentFamilyKind) -> Option<EquivalentQueryFamily> {
-        if !supports_equivalent_families(self.schema) {
-            return None;
-        }
-
-        let intent = self.semantic_intent_for(family_kind);
+        let intent = self.semantic_intent_for(family_kind)?;
 
         Some(match family_kind {
             EquivalentFamilyKind::AbstractNamedVsConcreteNamed => {
@@ -828,14 +832,11 @@ impl<'a> EquivalentQueryFamilyGenerator<'a> {
         })
     }
 
-    fn semantic_intent_for(&self, family_kind: EquivalentFamilyKind) -> EquivalentSemanticIntent {
-        let root_field = if self.seed.is_multiple_of(2) {
-            RootFieldIntent::Me
-        } else {
-            RootFieldIntent::User {
-                id: "1".to_string(),
-            }
-        };
+    fn semantic_intent_for(
+        &self,
+        family_kind: EquivalentFamilyKind,
+    ) -> Option<EquivalentSemanticIntent> {
+        let candidate = self.equivalent_family_candidate()?;
 
         let directives = match family_kind {
             EquivalentFamilyKind::DirectiveBearingEquivalent => SemanticDirectiveIntent {
@@ -848,23 +849,87 @@ impl<'a> EquivalentQueryFamilyGenerator<'a> {
             },
         };
 
-        EquivalentSemanticIntent {
+        Some(EquivalentSemanticIntent {
             operation_name: format!("EquivalentFamily{}", self.seed),
-            root_field,
-            target_field: "socialAccounts",
-            abstract_type: "SocialAccount",
-            concrete_type: "TwitterAccount",
-            shared_fields: vec![
-                SemanticSelectionIntent { field_name: "url" },
-                SemanticSelectionIntent {
-                    field_name: "handle",
-                },
-            ],
-            concrete_fields: vec![SemanticSelectionIntent {
-                field_name: "followers",
-            }],
+            root_field: candidate.root_field,
+            target_field: candidate.target_field,
+            abstract_type: candidate.abstract_type,
+            concrete_type: candidate.concrete_type,
+            shared_fields: candidate
+                .shared_fields
+                .into_iter()
+                .map(|field_name| SemanticSelectionIntent { field_name })
+                .collect(),
+            concrete_fields: candidate
+                .concrete_fields
+                .into_iter()
+                .map(|field_name| SemanticSelectionIntent { field_name })
+                .collect(),
             directives,
+        })
+    }
+
+    fn equivalent_family_candidate(&self) -> Option<EquivalentFamilyCandidate> {
+        let query_type_name = self.schema.query_type_name();
+        let query_type = self.schema.type_by_name(query_type_name)?;
+        let TypeDefinitionFields::Fields(query_fields) = query_type.fields()? else {
+            return None;
+        };
+
+        let mut candidates = Vec::new();
+
+        for query_field in query_fields {
+            let root_field_type_name = query_field.field_type.inner_type();
+            let Some(root_type) = self.schema.type_by_name(root_field_type_name) else {
+                continue;
+            };
+            let Some(root_field_intent) = render_root_field(query_field) else {
+                continue;
+            };
+
+            let TypeDefinitionFields::Fields(root_fields) = root_type.fields()? else {
+                continue;
+            };
+
+            for root_field in root_fields {
+                let abstract_type_name = root_field.field_type.inner_type();
+                let Some(abstract_type) = self.schema.type_by_name(abstract_type_name) else {
+                    continue;
+                };
+
+                if !abstract_type.is_abstract_type() {
+                    continue;
+                }
+
+                let shared_fields = collect_leaf_field_names(abstract_type);
+                if shared_fields.is_empty() {
+                    continue;
+                }
+
+                for concrete_type in abstract_type.possible_types(self.schema) {
+                    let concrete_fields = collect_extra_leaf_field_names(concrete_type, &shared_fields);
+                    if concrete_fields.is_empty() {
+                        continue;
+                    }
+
+                    candidates.push(EquivalentFamilyCandidate {
+                        root_field: root_field_intent.clone(),
+                        target_field: root_field.name.clone(),
+                        abstract_type: abstract_type.name().to_string(),
+                        concrete_type: concrete_type.name().to_string(),
+                        shared_fields: shared_fields.clone(),
+                        concrete_fields,
+                    });
+                }
+            }
         }
+
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let index = (self.seed as usize) % candidates.len();
+        candidates.into_iter().nth(index)
     }
 
     fn render_abstract_named_vs_concrete_named(
@@ -1151,7 +1216,7 @@ impl<'a> EquivalentQueryFamilyGenerator<'a> {
 fn render_fields(fields: &[SemanticSelectionIntent]) -> String {
     fields
         .iter()
-        .map(|field| field.field_name)
+        .map(|field| field.field_name.as_str())
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1174,24 +1239,64 @@ fn render_bool_variables_json(variables: &BTreeMap<String, bool>) -> String {
     format!("{{{}}}", body)
 }
 
-fn supports_equivalent_families(schema: &SchemaDocument) -> bool {
-    schema.type_by_name("SocialAccount").is_some()
-        && schema.type_by_name("TwitterAccount").is_some()
-        && has_field(schema, "Query", "me")
-        && has_field(schema, "Query", "user")
-        && has_field(schema, "User", "socialAccounts")
+fn collect_leaf_field_names(type_def: &s::TypeDefinition) -> Vec<String> {
+    match type_def.fields() {
+        Some(TypeDefinitionFields::Fields(fields)) => fields
+            .iter()
+            .filter(|field| matches!(field.field_type.inner_type(), "String" | "Int" | "Float" | "Boolean" | "ID"))
+            .map(|field| field.name.clone())
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
-fn has_field(schema: &SchemaDocument, type_name: &str, field_name: &str) -> bool {
-    schema
-        .type_by_name(type_name)
-        .and_then(|type_def| match type_def.fields() {
-            Some(TypeDefinitionFields::Fields(fields)) => {
-                Some(fields.iter().any(|field| field.name == field_name))
+fn collect_extra_leaf_field_names(
+    concrete_type: &s::TypeDefinition,
+    shared_fields: &[String],
+) -> Vec<String> {
+    match concrete_type.fields() {
+        Some(TypeDefinitionFields::Fields(fields)) => fields
+            .iter()
+            .filter(|field| {
+                matches!(field.field_type.inner_type(), "String" | "Int" | "Float" | "Boolean" | "ID")
+                    && !shared_fields.iter().any(|shared| shared == &field.name)
+            })
+            .map(|field| field.name.clone())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn render_root_field(field: &s::Field) -> Option<RootFieldIntent> {
+    let mut rendered = field.name.clone();
+
+    if !field.arguments.is_empty() {
+        let mut rendered_args = Vec::new();
+        for arg in &field.arguments {
+            let required = arg.value_type.is_non_null() && arg.default_value.is_none();
+            if !required {
+                continue;
             }
-            _ => None,
-        })
-        .unwrap_or(false)
+
+            let value = match arg.value_type.inner_type() {
+                "ID" => format!("\"id-1\""),
+                "String" => format!("\"s1\""),
+                "Int" => "1".to_string(),
+                "Float" => "1.0".to_string(),
+                "Boolean" => "true".to_string(),
+                _ => return None,
+            };
+            rendered_args.push(format!("{}: {}", arg.name, value));
+        }
+
+        if !rendered_args.is_empty() {
+            rendered.push('(');
+            rendered.push_str(&rendered_args.join(", "));
+            rendered.push(')');
+        }
+    }
+
+    Some(RootFieldIntent::Rendered(rendered))
 }
 
 fn scheduled_case_kinds(scope: GenerationScope) -> Vec<CaseKind> {
