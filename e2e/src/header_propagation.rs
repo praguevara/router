@@ -1,8 +1,8 @@
 #[cfg(test)]
 
 mod header_propagation_e2e_tests {
-    use futures::join;
     use crate::testkit::{some_header_map, TestRouter, TestSubgraphs};
+    use futures::join;
 
     #[ntex::test]
     async fn should_propagate_headers_to_subgraphs() {
@@ -262,7 +262,9 @@ mod header_propagation_e2e_tests {
             .expect(1)
             .create();
 
-        let deduped_res = router.send_graphql_request("{ users { id } }", None, None).await;
+        let deduped_res = router
+            .send_graphql_request("{ users { id } }", None, None)
+            .await;
         accounts_response_mock.assert();
         assert_eq!(
             deduped_res
