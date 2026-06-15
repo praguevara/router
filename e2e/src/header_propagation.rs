@@ -288,4 +288,68 @@ mod header_propagation_e2e_tests {
             "expected the distinct request to carry its own propagated subgraph header"
         );
     }
+
+    #[ntex::test]
+    async fn should_not_override_router_selected_content_type() {
+        let subgraphs = TestSubgraphs::builder().build().start().await;
+        let mut accounts_server = mockito::Server::new_async().await;
+        let host = accounts_server.host_with_port();
+
+        let router = TestRouter::builder()
+            .inline_config(format!(
+                r#"
+                  supergraph:
+                    source: file
+                    path: supergraph.graphql
+                  traffic_shaping:
+                    all:
+                      dedupe_enabled: false
+                    router:
+                      dedupe:
+                        enabled: true
+                  headers:
+                    all:
+                      response:
+                        - propagate:
+                            named: content-type
+                            algorithm: last
+                  override_subgraph_urls:
+                      subgraphs:
+                          accounts:
+                              url: "http://{host}/accounts"
+                  "#
+            ))
+            .with_subgraphs(&subgraphs)
+            .build()
+            .start()
+            .await;
+
+        let accounts_response_mock = accounts_server
+            .mock("POST", "/accounts")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .expect(1)
+            .create();
+
+        let headers = some_header_map! {
+          http::header::ACCEPT => "application/graphql-response+json"
+        }
+        .expect("failed to compile headers");
+
+        let response = router
+            .send_graphql_request("{ users { id } }", None, Some(headers.clone()))
+            .await;
+
+        accounts_response_mock.assert();
+
+        assert!(response.status().is_success(), "Expected 200 OK");
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/graphql-response+json"),
+            "expected content-type to win over propagated content-type"
+        );
+    }
 }
