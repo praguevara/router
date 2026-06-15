@@ -1,6 +1,7 @@
 #[cfg(test)]
 
 mod header_propagation_e2e_tests {
+    use futures::join;
     use crate::testkit::{some_header_map, TestRouter, TestSubgraphs};
 
     #[ntex::test]
@@ -148,6 +149,141 @@ mod header_propagation_e2e_tests {
                 .and_then(|v| v.to_str().ok()),
             Some("accounts"),
             "expected x-subgraph header to be propagated"
+        );
+    }
+
+    #[ntex::test]
+    async fn should_propagate_response_headers_for_deduped_follower_requests() {
+        let subgraphs = TestSubgraphs::builder()
+            .with_delay(std::time::Duration::from_millis(100))
+            .build()
+            .start()
+            .await;
+        let mut accounts_server = mockito::Server::new_async().await;
+        let host = accounts_server.host_with_port();
+
+        let router = TestRouter::builder()
+            .inline_config(format!(
+                r#"
+                  supergraph:
+                    source: file
+                    path: supergraph.graphql
+                  traffic_shaping:
+                    all:
+                      dedupe_enabled: false
+                    router:
+                      dedupe:
+                        enabled: true
+                  headers:
+                    all:
+                      response:
+                        - propagate:
+                            named: x-subgraph
+                            algorithm: last
+                  override_subgraph_urls:
+                      subgraphs:
+                          accounts:
+                              url: "http://{host}/accounts"
+                  "#
+            ))
+            .with_subgraphs(&subgraphs)
+            .build()
+            .start()
+            .await;
+
+        let accounts_response_mock = accounts_server
+            .mock("POST", "/accounts")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("x-subgraph", "accounts")
+            .expect(1)
+            .create();
+
+        let (response_a, response_b) = join!(
+            router.send_graphql_request("{ users { id } }", None, None),
+            router.send_graphql_request("{ users { id } }", None, None)
+        );
+
+        accounts_response_mock.assert();
+
+        for response in [&response_a, &response_b] {
+            assert!(response.status().is_success(), "Expected 200 OK");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("x-subgraph")
+                    .and_then(|v| v.to_str().ok()),
+                Some("accounts"),
+                "expected x-subgraph header to be propagated"
+            );
+        }
+    }
+
+    #[ntex::test]
+    async fn should_not_leak_propagated_response_headers_between_distinct_requests() {
+        let subgraphs = TestSubgraphs::builder().build().start().await;
+        let mut accounts_server = mockito::Server::new_async().await;
+        let host = accounts_server.host_with_port();
+
+        let router = TestRouter::builder()
+            .inline_config(format!(
+                r#"
+                  supergraph:
+                    source: file
+                    path: supergraph.graphql
+                  traffic_shaping:
+                    all:
+                      dedupe_enabled: false
+                    router:
+                      dedupe:
+                        enabled: true
+                  headers:
+                    all:
+                      response:
+                        - propagate:
+                            named: x-subgraph
+                            algorithm: last
+                  override_subgraph_urls:
+                      subgraphs:
+                          accounts:
+                              url: "http://{host}/accounts"
+                  "#
+            ))
+            .with_subgraphs(&subgraphs)
+            .build()
+            .start()
+            .await;
+
+        let accounts_response_mock = accounts_server
+            .mock("POST", "/accounts")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("x-subgraph", "accounts")
+            .expect(1)
+            .create();
+
+        let deduped_res = router.send_graphql_request("{ users { id } }", None, None).await;
+        accounts_response_mock.assert();
+        assert_eq!(
+            deduped_res
+                .headers()
+                .get("x-subgraph")
+                .and_then(|v| v.to_str().ok()),
+            Some("accounts")
+        );
+
+        let plain_res = router
+            .send_graphql_request("{ topProducts { name } }", None, None)
+            .await;
+
+        assert!(plain_res.status().is_success(), "Expected 200 OK");
+        assert_eq!(
+            plain_res
+                .headers()
+                .get("x-subgraph")
+                .and_then(|v| v.to_str().ok()),
+            Some("products"),
+            "expected the distinct request to carry its own propagated subgraph header"
         );
     }
 }
