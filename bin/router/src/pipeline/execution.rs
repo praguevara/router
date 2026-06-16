@@ -58,6 +58,8 @@ pub async fn execute_plan<'exec>(
             .clone(),
         schema: Arc::clone(&supergraph.planner.consumer_schema.document),
         metadata: Arc::clone(&supergraph.metadata),
+        index: Arc::clone(&supergraph.semantic_index),
+        variables: planned_request.variable_payload.clone(),
     };
     async {
         let mut extensions = ExecutionResultExtensions::default();

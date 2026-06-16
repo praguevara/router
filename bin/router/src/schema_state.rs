@@ -23,7 +23,7 @@ use hive_router_plan_executor::{
         OnSupergraphLoadEndHookPayload, OnSupergraphLoadStartHookPayload, PublicSchema,
         SupergraphData,
     },
-    introspection::schema::SchemaWithMetadata,
+    introspection::{schema::SchemaWithMetadata, semantic::SemanticIndex},
     plugin_trait::{EndControlFlow, RouterPluginBoxed, StartControlFlow},
     response::graphql_error::GraphQLError,
     SubgraphExecutorMap,
@@ -288,6 +288,10 @@ impl SchemaState {
             },
         )?;
         let metadata = Arc::new(planner.consumer_schema.schema_metadata());
+        let semantic_index = Arc::new(SemanticIndex::build(
+            &planner.consumer_schema.document,
+            &metadata,
+        ));
         let authorization = AuthorizationMetadata::build(&planner.supergraph, &metadata)?;
         let operation_name_forward_config = Arc::new(OperationNameForwardConfig::new(
             &router_config.traffic_shaping,
@@ -307,6 +311,7 @@ impl SchemaState {
                 sdl: Arc::<str>::from(planner.consumer_schema.document.to_string()),
             },
             metadata,
+            semantic_index,
             planner,
             authorization,
             subgraph_executor_map,

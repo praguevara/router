@@ -16,12 +16,16 @@ use hive_router_query_planner::ast::{
 use hive_router_query_planner::state::supergraph_state::OperationKind;
 
 use crate::introspection::schema::SchemaMetadata;
+use crate::introspection::semantic::SemanticIndex;
 use crate::response::value::Value;
 
 pub struct IntrospectionContext {
     pub query: Option<Arc<OperationDefinition>>,
     pub schema: Arc<Document>,
     pub metadata: Arc<SchemaMetadata>,
+    /// Index backing the `__search` / `__definitions` semantic-introspection
+    /// meta-fields.
+    pub index: Arc<SemanticIndex>,
 }
 
 fn get_deprecation_reason(directives: &[Directive]) -> Option<&str> {
@@ -617,6 +621,12 @@ fn resolve_root_introspection_selections<'exec>(
         if let SelectionItem::Field(field) = item {
             let value = match field.name.as_str() {
                 "__schema" => resolve_schema_field(field, ctx),
+                // Semantic introspection (`docs/design/semantic-introspection/main.md`).
+                // Phase 0 returns empty lists so the full pipeline (validation,
+                // normalization, partition, projection) can be exercised before
+                // the index and resolvers land.
+                "__search" => Value::Array(Vec::new()),
+                "__definitions" => Value::Array(Vec::new()),
                 "__type" => {
                     if let Some(args) = &field.arguments {
                         if let Some(AstValue::String(type_name)) = args.get_argument("name") {
