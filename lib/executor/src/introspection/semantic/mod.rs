@@ -5,12 +5,23 @@
 //! supergraph load (alongside [`SchemaMetadata`]) from the consumer schema and
 //! held immutably behind an `Arc` in `SupergraphData`.
 //!
-//! Phase 0 ships the type and wiring with an empty implementation; later phases
-//! fill in the BM25 corpus and precomputed paths-to-root.
+//! MVP scope: a BM25 corpus over named types and object/interface fields, plus
+//! precomputed shortest paths-to-root. Argument, input-field and enum-value
+//! coordinates, pluggable/embedding backends, and auth-aware filtering are
+//! deliberately left as extension points (see the design doc).
 
-use graphql_tools::static_graphql::schema::Document;
+mod bm25;
+mod paths;
+mod tokenize;
+
+use std::cmp::Ordering;
+
+use ahash::HashMap;
+use graphql_tools::static_graphql::schema::{Definition, Document, Field, TypeDefinition};
 
 use crate::introspection::schema::SchemaMetadata;
+use bm25::{Bm25Builder, Bm25Index};
+use tokenize::tokenize;
 
 /// Options for a [`SemanticIndex::search`] call, mapped from the `__search`
 /// field arguments.
@@ -18,7 +29,7 @@ use crate::introspection::schema::SchemaMetadata;
 pub struct SearchOptions {
     /// Maximum number of results to return (`first`).
     pub first: usize,
-    /// Offset to resume from, decoded from the opaque `after` cursor.
+    /// Global offset to resume from, decoded from the opaque `after` cursor.
     pub after: Option<usize>,
     /// Minimum normalized score in `[0, 1]` (`minScore`).
     pub min_score: Option<f64>,
@@ -40,37 +51,339 @@ impl Default for SearchOptions {
 pub struct SearchHit<'idx> {
     /// Schema coordinate of the match, e.g. `"Area.availableTaxis"`.
     pub coordinate: &'idx str,
-    /// Normalized relevance score in `[0, 1]`.
+    /// Normalized relevance score in `[0, 1]` (the top hit for a query is `1.0`).
     pub score: f64,
-    /// Zero-based global rank of this hit; the resolver encodes it as the
-    /// opaque `cursor`.
+    /// Zero-based global rank of this hit; the resolver encodes `rank + 1` as the
+    /// opaque `cursor` so the client can resume via `after`.
     pub rank: usize,
 }
 
 /// An immutable, per-schema semantic search index.
 #[derive(Debug, Default)]
 pub struct SemanticIndex {
-    // Phase 1a populates a BM25 corpus and precomputed paths-to-root here.
+    /// Document index -> schema coordinate (parallel to the BM25 corpus).
+    coordinates: Vec<String>,
+    bm25: Bm25Index,
+    /// Type name -> shortest field-coordinate path from a root type.
+    type_shortest_path: HashMap<String, Vec<String>>,
 }
 
 impl SemanticIndex {
     /// Builds the index from the consumer schema document and its derived
-    /// metadata. Cheap no-op until Phase 1a.
+    /// metadata.
     pub fn build(schema: &Document, metadata: &SchemaMetadata) -> Self {
-        let _ = (schema, metadata);
-        Self::default()
+        let mut builder = Bm25Builder::new();
+        let mut coordinates: Vec<String> = Vec::new();
+
+        for def in &schema.definitions {
+            let Definition::TypeDefinition(type_def) = def else {
+                continue;
+            };
+            let type_name = type_def.name();
+            // Skip introspection machinery (`__Schema`, `__SearchResult`, ...).
+            if type_name.starts_with("__") {
+                continue;
+            }
+
+            // Type-level document: name + description, enriched with member names
+            // for kinds that have no separate field documents.
+            let mut type_tokens = tokenize(type_name);
+            if let Some(desc) = type_description(type_def) {
+                type_tokens.extend(tokenize(desc));
+            }
+
+            match type_def {
+                TypeDefinition::Object(o) => {
+                    for f in &o.fields {
+                        if f.name.starts_with("__") {
+                            continue;
+                        }
+                        builder.add(field_tokens(type_name, f));
+                        coordinates.push(format!("{type_name}.{}", f.name));
+                    }
+                }
+                TypeDefinition::Interface(i) => {
+                    for f in &i.fields {
+                        if f.name.starts_with("__") {
+                            continue;
+                        }
+                        builder.add(field_tokens(type_name, f));
+                        coordinates.push(format!("{type_name}.{}", f.name));
+                    }
+                }
+                TypeDefinition::Enum(e) => {
+                    for v in &e.values {
+                        type_tokens.extend(tokenize(&v.name));
+                        if let Some(d) = &v.description {
+                            type_tokens.extend(tokenize(d));
+                        }
+                    }
+                }
+                TypeDefinition::InputObject(io) => {
+                    for f in &io.fields {
+                        type_tokens.extend(tokenize(&f.name));
+                    }
+                }
+                TypeDefinition::Union(u) => {
+                    for member in &u.types {
+                        type_tokens.extend(tokenize(member));
+                    }
+                }
+                TypeDefinition::Scalar(_) => {}
+            }
+
+            builder.add(type_tokens);
+            coordinates.push(type_name.to_string());
+        }
+
+        let mut roots: Vec<&str> = vec![schema.query_type_name()];
+        if let Some(m) = schema.mutation_type_name() {
+            roots.push(m);
+        }
+        if let Some(s) = schema.subscription_type_name() {
+            roots.push(s);
+        }
+        let type_shortest_path = paths::build_paths_to_root(metadata, &roots);
+
+        Self {
+            coordinates,
+            bm25: builder.build(),
+            type_shortest_path,
+        }
     }
 
-    /// Returns ranked hits for a natural-language `query`. Empty until Phase 1a.
+    /// Returns ranked hits for a natural-language `query`, ordered by score
+    /// descending. Scores are normalized so the top hit of a query is `1.0`.
     pub fn search(&self, query: &str, opts: &SearchOptions) -> Vec<SearchHit<'_>> {
-        let _ = (query, opts);
-        Vec::new()
+        if opts.first == 0 {
+            return Vec::new();
+        }
+
+        let mut terms = tokenize(query);
+        terms.sort();
+        terms.dedup();
+        if terms.is_empty() {
+            return Vec::new();
+        }
+
+        let mut scored = self.bm25.score(&terms);
+        if scored.is_empty() {
+            return Vec::new();
+        }
+
+        // Sort by score descending; break ties on coordinate for deterministic,
+        // stable pagination.
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| self.coordinates[a.0].cmp(&self.coordinates[b.0]))
+        });
+
+        let max = scored[0].1;
+        let inv_max = if max > 0.0 { 1.0 / max } else { 0.0 };
+        let min_score = opts.min_score.unwrap_or(0.0);
+        let start = opts.after.unwrap_or(0);
+
+        let mut hits = Vec::new();
+        for (rank, (doc, raw)) in scored.iter().enumerate() {
+            let score = raw * inv_max;
+            // Sorted descending, so once below the threshold nothing else qualifies.
+            if score < min_score {
+                break;
+            }
+            if rank < start {
+                continue;
+            }
+            if hits.len() >= opts.first {
+                break;
+            }
+            hits.push(SearchHit {
+                coordinate: self.coordinates[*doc].as_str(),
+                score,
+                rank,
+            });
+        }
+        hits
     }
 
     /// Returns the precomputed shortest field-coordinate paths from a root type
-    /// to `coordinate`, or an empty list when none exist. Empty until Phase 1a.
-    pub fn paths_to_root(&self, coordinate: &str) -> Vec<Vec<&str>> {
-        let _ = coordinate;
-        Vec::new()
+    /// to `coordinate`, or an empty list when none exist.
+    pub fn paths_to_root(&self, coordinate: &str) -> Vec<Vec<String>> {
+        if let Some((parent, _field)) = coordinate.split_once('.') {
+            // Field coordinate: path to the parent type, then the field itself.
+            match self.type_shortest_path.get(parent) {
+                Some(base) => {
+                    let mut path = base.clone();
+                    path.push(coordinate.to_string());
+                    vec![path]
+                }
+                None => Vec::new(),
+            }
+        } else {
+            // Type coordinate: the navigation path to the type (empty for roots).
+            match self.type_shortest_path.get(coordinate) {
+                Some(path) if !path.is_empty() => vec![path.clone()],
+                _ => Vec::new(),
+            }
+        }
+    }
+}
+
+fn type_description(type_def: &TypeDefinition) -> Option<&str> {
+    match type_def {
+        TypeDefinition::Scalar(s) => s.description.as_deref(),
+        TypeDefinition::Object(o) => o.description.as_deref(),
+        TypeDefinition::Interface(i) => i.description.as_deref(),
+        TypeDefinition::Union(u) => u.description.as_deref(),
+        TypeDefinition::Enum(e) => e.description.as_deref(),
+        TypeDefinition::InputObject(io) => io.description.as_deref(),
+    }
+}
+
+fn field_tokens(parent_type: &str, field: &Field) -> Vec<String> {
+    let mut tokens = tokenize(&field.name);
+    tokens.extend(tokenize(parent_type));
+    if let Some(desc) = &field.description {
+        tokens.extend(tokenize(desc));
+    }
+    for arg in &field.arguments {
+        tokens.extend(tokenize(&arg.name));
+        if let Some(desc) = &arg.description {
+            tokens.extend(tokenize(desc));
+        }
+    }
+    tokens
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use graphql_tools::parser::schema::parse_schema;
+    use hive_router_query_planner::consumer_schema::ConsumerSchema;
+
+    use crate::introspection::schema::SchemaWithMetadata;
+
+    const SDL: &str = r#"
+        type Query {
+          "Look up an area by its name."
+          areaByName(name: String!): Area
+        }
+
+        "A geographic area in the city."
+        type Area {
+          name: String!
+          "Returns the number of available taxis in the area."
+          availableTaxis: Int!
+          nearestStation: Station
+        }
+
+        type Station {
+          name: String!
+        }
+    "#;
+
+    fn build_index() -> (
+        SemanticIndex,
+        std::sync::Arc<graphql_tools::static_graphql::schema::Document>,
+    ) {
+        let supergraph = parse_schema(SDL).unwrap();
+        // Reuse the production consumer-schema build so the index sees exactly
+        // what introspection exposes (including the injected meta-fields).
+        let consumer = ConsumerSchema::new_from_supergraph(&supergraph);
+        let metadata = consumer.schema_metadata();
+        let index = SemanticIndex::build(&consumer.document, &metadata);
+        (index, consumer.document.clone())
+    }
+
+    #[test]
+    fn finds_field_by_description() {
+        let (index, _doc) = build_index();
+        let hits = index.search("available taxis", &SearchOptions::default());
+        assert!(!hits.is_empty(), "expected at least one hit");
+        assert_eq!(hits[0].coordinate, "Area.availableTaxis");
+        assert!(
+            (hits[0].score - 1.0).abs() < f64::EPSILON,
+            "top hit normalizes to 1.0"
+        );
+    }
+
+    #[test]
+    fn does_not_index_introspection_types() {
+        let (index, _doc) = build_index();
+        let hits = index.search(
+            "search definitions schema",
+            &SearchOptions {
+                first: 50,
+                ..Default::default()
+            },
+        );
+        assert!(
+            hits.iter().all(|h| !h.coordinate.starts_with("__")),
+            "introspection coordinates must not be searchable"
+        );
+    }
+
+    #[test]
+    fn paths_to_root_match_navigation() {
+        let (index, _doc) = build_index();
+        assert_eq!(
+            index.paths_to_root("Area.availableTaxis"),
+            vec![vec![
+                "Query.areaByName".to_string(),
+                "Area.availableTaxis".to_string()
+            ]]
+        );
+        assert_eq!(
+            index.paths_to_root("Query.areaByName"),
+            vec![vec!["Query.areaByName".to_string()]]
+        );
+    }
+
+    #[test]
+    fn pagination_with_first_and_after() {
+        let (index, _doc) = build_index();
+        let page1 = index.search(
+            "name",
+            &SearchOptions {
+                first: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(page1.len(), 1);
+        let next = page1[0].rank + 1;
+        let page2 = index.search(
+            "name",
+            &SearchOptions {
+                first: 1,
+                after: Some(next),
+                ..Default::default()
+            },
+        );
+        if let Some(hit) = page2.first() {
+            assert_ne!(hit.coordinate, page1[0].coordinate);
+            assert!(hit.rank >= next);
+        }
+    }
+
+    #[test]
+    fn min_score_filters_weak_matches() {
+        let (index, _doc) = build_index();
+        let all = index.search(
+            "name",
+            &SearchOptions {
+                first: 50,
+                ..Default::default()
+            },
+        );
+        let filtered = index.search(
+            "name",
+            &SearchOptions {
+                first: 50,
+                min_score: Some(0.99),
+                ..Default::default()
+            },
+        );
+        assert!(filtered.len() <= all.len());
+        assert!(filtered.iter().all(|h| h.score >= 0.99));
     }
 }
