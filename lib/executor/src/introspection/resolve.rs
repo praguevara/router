@@ -16,7 +16,7 @@ use hive_router_query_planner::ast::{
 use hive_router_query_planner::state::supergraph_state::OperationKind;
 
 use crate::introspection::schema::SchemaMetadata;
-use crate::introspection::semantic::{SearchOptions, SemanticIndex};
+use crate::introspection::semantic::{SearchOptions, SemanticSearchProvider};
 use crate::response::value::Value;
 
 pub struct IntrospectionContext {
@@ -25,7 +25,12 @@ pub struct IntrospectionContext {
     pub metadata: Arc<SchemaMetadata>,
     /// Index backing the `__search` / `__definitions` semantic-introspection
     /// meta-fields.
-    pub index: Arc<SemanticIndex>,
+    pub index: Arc<dyn SemanticSearchProvider>,
+    /// Coerced operation variables. The semantic-introspection meta-fields are
+    /// resolved here against the query AST (they are not federated), so variable
+    /// references in their arguments (`__search(query: $q)`) must be resolved
+    /// from this map rather than read as literals.
+    pub variables: Arc<CoerceVariablesPayload>,
 }
 
 fn get_deprecation_reason(directives: &[Directive]) -> Option<&str> {
@@ -717,7 +722,7 @@ fn decode_cursor(cursor: &str) -> Option<usize> {
     cursor.parse::<usize>().ok()
 }
 
-fn resolve_search<'exec>(
+async fn resolve_search<'exec>(
     field: &'exec FieldSelection,
     ctx: &'exec IntrospectionContext,
 ) -> Value<'exec> {
@@ -756,9 +761,10 @@ fn resolve_search<'exec>(
     let results = ctx
         .index
         .search(query, &opts)
+        .await
         .into_iter()
         .map(|hit| {
-            resolve_search_result(hit.coordinate, hit.score, hit.rank, &field.selections, ctx)
+            resolve_search_result(&hit.coordinate, hit.score, hit.rank, &field.selections, ctx)
         })
         .collect();
 
@@ -766,7 +772,7 @@ fn resolve_search<'exec>(
 }
 
 fn resolve_search_result<'exec>(
-    coordinate: &'exec str,
+    coordinate: &str,
     score: f64,
     rank: usize,
     selections: &'exec SelectionSet,
@@ -779,7 +785,7 @@ fn resolve_search_result<'exec>(
 }
 
 fn resolve_search_result_selections<'exec>(
-    coordinate: &'exec str,
+    coordinate: &str,
     score: f64,
     rank: usize,
     selection_items: &'exec Vec<SelectionItem>,
@@ -789,7 +795,7 @@ fn resolve_search_result_selections<'exec>(
     for item in selection_items {
         if let SelectionItem::Field(field) = item {
             let value = match field.name.as_str() {
-                "coordinate" => Value::String(coordinate.into()),
+                "coordinate" => Value::String(coordinate.to_owned().into()),
                 "score" => Value::F64(score),
                 "cursor" => Value::String(encode_cursor(rank).into()),
                 "pathsToRoot" => {
@@ -850,7 +856,7 @@ fn resolve_definitions<'exec>(
     Value::Array(results)
 }
 
-pub fn resolve_introspection<'exec>(
+pub async fn resolve_introspection<'exec>(
     operation_definition: &'exec OperationDefinition,
     ctx: &'exec IntrospectionContext,
 ) -> Value<'exec> {
@@ -870,13 +876,13 @@ pub fn resolve_introspection<'exec>(
         .unwrap_or_else(|| ctx.schema.query_type_name());
 
     let mut data =
-        resolve_root_introspection_selections(root_type_name, &root_selection_set.items, ctx);
+        resolve_root_introspection_selections(root_type_name, &root_selection_set.items, ctx).await;
 
     data.sort_by_key(|(k, _)| *k);
     Value::Object(data)
 }
 
-fn resolve_root_introspection_selections<'exec>(
+async fn resolve_root_introspection_selections<'exec>(
     root_type_name: &'exec str,
     items: &'exec Vec<SelectionItem>,
     ctx: &'exec IntrospectionContext,
@@ -887,7 +893,7 @@ fn resolve_root_introspection_selections<'exec>(
             let value = match field.name.as_str() {
                 "__schema" => resolve_schema_field(field, ctx),
                 // Semantic introspection (`docs/design/semantic-introspection/main.md`).
-                "__search" => resolve_search(field, ctx),
+                "__search" => resolve_search(field, ctx).await,
                 "__definitions" => resolve_definitions(field, ctx),
                 "__type" => {
                     if let Some(args) = &field.arguments {
@@ -909,8 +915,12 @@ fn resolve_root_introspection_selections<'exec>(
         } else if let SelectionItem::InlineFragment(_) = item {
             let selection_items = item.selections();
             if let Some(selection_items) = selection_items {
-                let new_data =
-                    resolve_root_introspection_selections(root_type_name, selection_items, ctx);
+                let new_data = Box::pin(resolve_root_introspection_selections(
+                    root_type_name,
+                    selection_items,
+                    ctx,
+                ))
+                .await;
                 data.extend(new_data);
             }
         }

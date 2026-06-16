@@ -23,7 +23,10 @@ use hive_router_plan_executor::{
         OnSupergraphLoadEndHookPayload, OnSupergraphLoadStartHookPayload, PublicSchema,
         SupergraphData,
     },
-    introspection::{schema::SchemaWithMetadata, semantic::SemanticIndex},
+    introspection::{
+        schema::SchemaWithMetadata,
+        semantic::{Bm25Provider, SemanticSearchProvider},
+    },
     plugin_trait::{EndControlFlow, RouterPluginBoxed, StartControlFlow},
     response::graphql_error::GraphQLError,
     SubgraphExecutorMap,
@@ -288,7 +291,7 @@ impl SchemaState {
             },
         )?;
         let metadata = Arc::new(planner.consumer_schema.schema_metadata());
-        let semantic_index = Arc::new(SemanticIndex::build(
+        let semantic_index: Arc<dyn SemanticSearchProvider> = Arc::new(Bm25Provider::build(
             &planner.consumer_schema.document,
             &metadata,
         ));

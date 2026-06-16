@@ -412,7 +412,7 @@ pub async fn execute_query_plan<'exec>(
 
     let introspection_context_clone = Arc::clone(&opts.introspection_context);
     let data = if let Some(introspection_query) = &introspection_context_clone.query {
-        resolve_introspection(introspection_query, &introspection_context_clone)
+        resolve_introspection(introspection_query, &introspection_context_clone).await
     } else if opts.projection_plan.is_empty() {
         Value::Null
     } else {

@@ -1,14 +1,16 @@
-//! Semantic introspection index.
+//! Semantic introspection search.
 //!
 //! Backs the `__search` / `__definitions` introspection meta-fields described in
-//! `docs/design/semantic-introspection/main.md`. The index is built once per
-//! supergraph load (alongside [`SchemaMetadata`]) from the consumer schema and
-//! held immutably behind an `Arc` in `SupergraphData`.
+//! `docs/design/semantic-introspection/main.md`. Search is abstracted behind the
+//! [`SemanticSearchProvider`] trait so the ranking backend is pluggable; the
+//! default is [`Bm25Provider`], built once per supergraph load (alongside
+//! [`SchemaMetadata`]) from the consumer schema and held behind an
+//! `Arc<dyn SemanticSearchProvider>` in `SupergraphData`.
 //!
-//! MVP scope: a BM25 corpus over named types and object/interface fields, plus
-//! precomputed shortest paths-to-root. Argument, input-field and enum-value
-//! coordinates, pluggable/embedding backends, and auth-aware filtering are
-//! deliberately left as extension points (see the design doc).
+//! `Bm25Provider` scope: a BM25 corpus over named types and object/interface
+//! fields, plus precomputed shortest paths-to-root. Argument, input-field and
+//! enum-value coordinates, embedding/vector backends, and auth-aware filtering
+//! are extension points (see the design doc).
 
 mod bm25;
 mod paths;
@@ -23,7 +25,7 @@ use crate::introspection::schema::SchemaMetadata;
 use bm25::{Bm25Builder, Bm25Index};
 use tokenize::tokenize;
 
-/// Options for a [`SemanticIndex::search`] call, mapped from the `__search`
+/// Options for a [`SemanticSearchProvider::search`] call, mapped from the `__search`
 /// field arguments.
 #[derive(Debug, Clone)]
 pub struct SearchOptions {
@@ -45,12 +47,11 @@ impl Default for SearchOptions {
     }
 }
 
-/// A single ranked search hit. `coordinate` borrows from the index, which lives
-/// as long as the surrounding [`crate::introspection::resolve::IntrospectionContext`].
+/// A single ranked search hit.
 #[derive(Debug, Clone)]
-pub struct SearchHit<'idx> {
+pub struct SearchHit {
     /// Schema coordinate of the match, e.g. `"Area.availableTaxis"`.
-    pub coordinate: &'idx str,
+    pub coordinate: String,
     /// Normalized relevance score in `[0, 1]` (the top hit for a query is `1.0`).
     pub score: f64,
     /// Zero-based global rank of this hit; the resolver encodes `rank + 1` as the
@@ -58,9 +59,24 @@ pub struct SearchHit<'idx> {
     pub rank: usize,
 }
 
-/// An immutable, per-schema semantic search index.
+/// A pluggable semantic-search backend. Held behind an
+/// `Arc<dyn SemanticSearchProvider>` in `SupergraphData`; the default
+/// implementation is [`Bm25Provider`].
+#[async_trait::async_trait]
+pub trait SemanticSearchProvider: Send + Sync {
+    /// Returns ranked hits for a natural-language `query`, ordered by score
+    /// descending. Scores are normalized so the top hit of a query is `1.0`.
+    async fn search(&self, query: &str, opts: &SearchOptions) -> Vec<SearchHit>;
+
+    /// Returns the shortest field-coordinate paths from a root type to
+    /// `coordinate`, or an empty list when none exist.
+    fn paths_to_root(&self, coordinate: &str) -> Vec<Vec<String>>;
+}
+
+/// Default BM25 search backend: a per-schema corpus over named types and
+/// object/interface fields, with precomputed shortest paths-to-root.
 #[derive(Debug, Default)]
-pub struct SemanticIndex {
+pub struct Bm25Provider {
     /// Document index -> schema coordinate (parallel to the BM25 corpus).
     coordinates: Vec<String>,
     bm25: Bm25Index,
@@ -68,7 +84,7 @@ pub struct SemanticIndex {
     type_shortest_path: HashMap<String, Vec<String>>,
 }
 
-impl SemanticIndex {
+impl Bm25Provider {
     /// Builds the index from the consumer schema document and its derived
     /// metadata.
     pub fn build(schema: &Document, metadata: &SchemaMetadata) -> Self {
@@ -151,10 +167,11 @@ impl SemanticIndex {
             type_shortest_path,
         }
     }
+}
 
-    /// Returns ranked hits for a natural-language `query`, ordered by score
-    /// descending. Scores are normalized so the top hit of a query is `1.0`.
-    pub fn search(&self, query: &str, opts: &SearchOptions) -> Vec<SearchHit<'_>> {
+#[async_trait::async_trait]
+impl SemanticSearchProvider for Bm25Provider {
+    async fn search(&self, query: &str, opts: &SearchOptions) -> Vec<SearchHit> {
         if opts.first == 0 {
             return Vec::new();
         }
@@ -198,7 +215,7 @@ impl SemanticIndex {
                 break;
             }
             hits.push(SearchHit {
-                coordinate: self.coordinates[*doc].as_str(),
+                coordinate: self.coordinates[*doc].clone(),
                 score,
                 rank,
             });
@@ -206,9 +223,7 @@ impl SemanticIndex {
         hits
     }
 
-    /// Returns the precomputed shortest field-coordinate paths from a root type
-    /// to `coordinate`, or an empty list when none exist.
-    pub fn paths_to_root(&self, coordinate: &str) -> Vec<Vec<String>> {
+    fn paths_to_root(&self, coordinate: &str) -> Vec<Vec<String>> {
         if let Some((parent, _field)) = coordinate.split_once('.') {
             // Field coordinate: path to the parent type, then the field itself.
             match self.type_shortest_path.get(parent) {
@@ -263,6 +278,11 @@ mod tests {
 
     use crate::introspection::schema::SchemaWithMetadata;
 
+    /// Block on the async provider `search` for synchronous unit tests.
+    fn search(index: &Bm25Provider, query: &str, opts: &SearchOptions) -> Vec<SearchHit> {
+        futures::executor::block_on(SemanticSearchProvider::search(index, query, opts))
+    }
+
     const SDL: &str = r#"
         type Query {
           "Look up an area by its name."
@@ -283,7 +303,7 @@ mod tests {
     "#;
 
     fn build_index() -> (
-        SemanticIndex,
+        Bm25Provider,
         std::sync::Arc<graphql_tools::static_graphql::schema::Document>,
     ) {
         let supergraph = parse_schema(SDL).unwrap();
@@ -291,14 +311,14 @@ mod tests {
         // what introspection exposes (including the injected meta-fields).
         let consumer = ConsumerSchema::new_from_supergraph(&supergraph);
         let metadata = consumer.schema_metadata();
-        let index = SemanticIndex::build(&consumer.document, &metadata);
+        let index = Bm25Provider::build(&consumer.document, &metadata);
         (index, consumer.document.clone())
     }
 
     #[test]
     fn finds_field_by_description() {
         let (index, _doc) = build_index();
-        let hits = index.search("available taxis", &SearchOptions::default());
+        let hits = search(&index, "available taxis", &SearchOptions::default());
         assert!(!hits.is_empty(), "expected at least one hit");
         assert_eq!(hits[0].coordinate, "Area.availableTaxis");
         assert!(
@@ -310,7 +330,8 @@ mod tests {
     #[test]
     fn does_not_index_introspection_types() {
         let (index, _doc) = build_index();
-        let hits = index.search(
+        let hits = search(
+            &index,
             "search definitions schema",
             &SearchOptions {
                 first: 50,
@@ -342,7 +363,8 @@ mod tests {
     #[test]
     fn pagination_with_first_and_after() {
         let (index, _doc) = build_index();
-        let page1 = index.search(
+        let page1 = search(
+            &index,
             "name",
             &SearchOptions {
                 first: 1,
@@ -351,7 +373,8 @@ mod tests {
         );
         assert_eq!(page1.len(), 1);
         let next = page1[0].rank + 1;
-        let page2 = index.search(
+        let page2 = search(
+            &index,
             "name",
             &SearchOptions {
                 first: 1,
@@ -368,14 +391,16 @@ mod tests {
     #[test]
     fn min_score_filters_weak_matches() {
         let (index, _doc) = build_index();
-        let all = index.search(
+        let all = search(
+            &index,
             "name",
             &SearchOptions {
                 first: 50,
                 ..Default::default()
             },
         );
-        let filtered = index.search(
+        let filtered = search(
+            &index,
             "name",
             &SearchOptions {
                 first: 50,
