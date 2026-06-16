@@ -83,6 +83,7 @@ impl SupergraphTestData {
             operation_for_plan_hash: hashes.operation_for_plan_hash,
             operation_for_introspection,
             operation_for_introspection_hash: hashes.operation_for_introspection_hash,
+            uses_semantic_introspection: false,
             normalized_operation_hash: hashes.combined_operation_hash,
             operation_identity: OperationIdentity {
                 name: doc.operation_name.clone(),

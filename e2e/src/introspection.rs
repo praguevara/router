@@ -383,6 +383,8 @@ mod introspection_e2e_tests {
                 r#"supergraph:
                 source: file
                 path: "./supergraph-introspection-extended.graphql"
+semantic_introspection:
+                enabled: true
           "#,
             )
             .build()
@@ -464,6 +466,8 @@ mod introspection_e2e_tests {
                 r#"supergraph:
                 source: file
                 path: "./supergraph-introspection-extended.graphql"
+semantic_introspection:
+                enabled: true
           "#,
             )
             .build()
@@ -536,5 +540,74 @@ mod introspection_e2e_tests {
             }
             "#);
         });
+    }
+
+    #[ntex::test]
+    async fn semantic_introspection_disabled_by_default() {
+        // No `semantic_introspection.enabled`, so the feature is off by default.
+        let router = TestRouter::builder()
+            .inline_config(
+                r#"supergraph:
+                source: file
+                path: "./supergraph-introspection-extended.graphql"
+          "#,
+            )
+            .build()
+            .start()
+            .await;
+
+        let resp = router
+            .send_graphql_request(r#"{ __search(query: "test") { coordinate } }"#, None, None)
+            .await;
+
+        assert_eq!(
+            resp.status().as_u16(),
+            403,
+            "semantic introspection must be rejected when disabled"
+        );
+        insta::assert_snapshot!(resp.json_body_string_pretty_stable().await, @r#"
+        {
+          "errors": [
+            {
+              "extensions": {
+                "code": "SEMANTIC_INTROSPECTION_DISABLED"
+              },
+              "message": "Semantic introspection is disabled"
+            }
+          ]
+        }
+        "#);
+    }
+
+    #[ntex::test]
+    async fn regular_introspection_unaffected_when_semantic_disabled() {
+        // Plain introspection must still work while semantic introspection is off.
+        let router = TestRouter::builder()
+            .inline_config(
+                r#"supergraph:
+                source: file
+                path: "./supergraph-introspection-extended.graphql"
+          "#,
+            )
+            .build()
+            .start()
+            .await;
+
+        let resp = router
+            .send_graphql_request(r#"{ __schema { queryType { name } } }"#, None, None)
+            .await;
+
+        assert!(resp.status().is_success(), "Expected 200 OK");
+        insta::assert_snapshot!(resp.json_body_string_pretty_stable().await, @r#"
+        {
+          "data": {
+            "__schema": {
+              "queryType": {
+                "name": "Query"
+              }
+            }
+          }
+        }
+        "#);
     }
 }

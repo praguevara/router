@@ -610,6 +610,12 @@ pub async fn execute_pipeline<'exec>(
 ) -> Result<QueryPlanExecutionResult, PipelineError> {
     if normalize_payload.operation_for_introspection.is_some() {
         handle_introspection_policy(&shared_state.introspection_policy, &client_request_details)?;
+
+        if normalize_payload.uses_semantic_introspection
+            && !shared_state.router_config.semantic_introspection.enabled
+        {
+            return Err(PipelineError::SemanticIntrospectionDisabled);
+        }
     }
 
     let cancellation_token =

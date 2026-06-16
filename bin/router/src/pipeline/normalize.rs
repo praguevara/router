@@ -11,6 +11,8 @@ use hive_router_plan_executor::projection::plan::FieldProjectionPlan;
 use hive_router_query_planner::ast::normalization::error::NormalizationError;
 use hive_router_query_planner::ast::normalization::normalize_operation;
 use hive_router_query_planner::ast::operation::OperationDefinition;
+use hive_router_query_planner::ast::selection_item::SelectionItem;
+use hive_router_query_planner::ast::selection_set::SelectionSet;
 use hive_router_query_planner::state::supergraph_state::OperationKind;
 use xxhash_rust::xxh3::Xxh3;
 
@@ -27,6 +29,9 @@ pub struct GraphQLNormalizationPayload {
     pub operation_for_plan_hash: u64,
     pub operation_for_introspection: Option<Arc<OperationDefinition>>,
     pub operation_for_introspection_hash: Option<u64>,
+    /// Whether the operation uses the semantic-introspection meta-fields
+    /// (`__search` / `__definitions`), used to gate the experimental feature.
+    pub uses_semantic_introspection: bool,
     pub normalized_operation_hash: u64,
     pub root_type_name: &'static str,
     pub projection_plan: Arc<Vec<FieldProjectionPlan>>,
@@ -49,6 +54,19 @@ impl<'a> From<&'a OperationIdentity> for GraphQLSpanOperationIdentity<'a> {
             client_document_hash: &op_id.client_document_hash,
         }
     }
+}
+
+/// Returns whether the (introspection) selection set selects a
+/// semantic-introspection meta-field (`__search` / `__definitions`) at any
+/// depth reachable without entering a regular field.
+fn selection_uses_semantic_introspection(selection_set: &SelectionSet) -> bool {
+    selection_set.items.iter().any(|item| match item {
+        SelectionItem::Field(field) => field.name == "__search" || field.name == "__definitions",
+        SelectionItem::InlineFragment(frag) => {
+            selection_uses_semantic_introspection(&frag.selections)
+        }
+        SelectionItem::FragmentSpread(_) => false,
+    })
 }
 
 pub fn hash_normalized_operation(
@@ -125,6 +143,10 @@ pub async fn normalize_request_with_cache(
                 let operation_for_introspection =
                     partitioned_operation.introspection_operation.map(Arc::new);
 
+                let uses_semantic_introspection = operation_for_introspection
+                    .as_ref()
+                    .is_some_and(|op| selection_uses_semantic_introspection(&op.selection_set));
+
                 let hashes = hash_normalized_operation(
                     &operation_for_plan,
                     operation_for_introspection.as_deref(),
@@ -137,6 +159,7 @@ pub async fn normalize_request_with_cache(
                     operation_for_plan_hash: hashes.operation_for_plan_hash,
                     operation_for_introspection,
                     operation_for_introspection_hash: hashes.operation_for_introspection_hash,
+                    uses_semantic_introspection,
                     normalized_operation_hash: hashes.combined_operation_hash,
                     operation_identity: OperationIdentity {
                         name: doc.operation_name.clone(),
