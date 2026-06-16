@@ -187,6 +187,17 @@ existing builders intentionally walk every inline fragment regardless of type
 condition, which is correct for a concrete type but wrong for a union, hence the
 dispatcher.)
 
+### Client usage note: aliasing across `__SchemaDefinition` members
+
+Because validation runs against the consumer schema (which knows the union and
+its members), a query that selects the same field across members with different
+response shapes is correctly rejected. The clearest case is `name`:
+`__Type.name` is `String` while `__Field.name` / `__InputValue.name` are
+`String!`, so selecting an unaliased `name` under both `... on __Type` and
+`... on __Field` is an `OverlappingFieldsCanBeMerged` conflict (differing
+nullability). Clients must alias such fields per member, e.g.
+`... on __Type { typeName: name }` and `... on __Field { fieldName: name }`.
+
 ## Configuration
 
 ```yaml

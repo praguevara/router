@@ -16,7 +16,7 @@ use hive_router_query_planner::ast::{
 use hive_router_query_planner::state::supergraph_state::OperationKind;
 
 use crate::introspection::schema::SchemaMetadata;
-use crate::introspection::semantic::SemanticIndex;
+use crate::introspection::semantic::{SearchOptions, SemanticIndex};
 use crate::response::value::Value;
 
 pub struct IntrospectionContext {
@@ -585,6 +585,271 @@ fn resolve_schema_selections<'exec>(
     schema_data
 }
 
+// ---------------------------------------------------------------------------
+// Semantic introspection: `__search` and `__definitions`.
+// See `docs/design/semantic-introspection/main.md`.
+// ---------------------------------------------------------------------------
+
+/// A located member of the schema, used to resolve the `__SchemaDefinition`
+/// union. Holds borrows into the consumer schema (`'exec`).
+#[derive(Clone, Copy)]
+enum SchemaMember<'exec> {
+    Type(&'exec TypeDefinition),
+    Field(&'exec Field),
+    InputValue(&'exec InputValue),
+    EnumValue(&'exec EnumValue),
+    Directive(&'exec DirectiveDefinition),
+}
+
+impl SchemaMember<'_> {
+    fn typename(&self) -> &'static str {
+        match self {
+            SchemaMember::Type(_) => "__Type",
+            SchemaMember::Field(_) => "__Field",
+            SchemaMember::InputValue(_) => "__InputValue",
+            SchemaMember::EnumValue(_) => "__EnumValue",
+            SchemaMember::Directive(_) => "__Directive",
+        }
+    }
+}
+
+/// Resolves a schema coordinate to the underlying definition. Supported shapes:
+/// `Type`, `Type.field` (object/interface field, input field, or enum value),
+/// `Type.field.arg` (field argument), and `@directive`.
+fn locate_member<'exec>(
+    coordinate: &str,
+    ctx: &'exec IntrospectionContext,
+) -> Option<SchemaMember<'exec>> {
+    if let Some(directive_name) = coordinate.strip_prefix('@') {
+        return ctx
+            .schema
+            .directive_by_name(directive_name)
+            .map(SchemaMember::Directive);
+    }
+
+    let mut parts = coordinate.split('.');
+    let type_name = parts.next()?;
+    let type_def = ctx.schema.type_by_name(type_name)?;
+
+    match (parts.next(), parts.next(), parts.next()) {
+        (None, _, _) => Some(SchemaMember::Type(type_def)),
+        (Some(member_name), None, _) => match type_def {
+            TypeDefinition::Object(_) | TypeDefinition::Interface(_) => {
+                type_def.field_by_name(member_name).map(SchemaMember::Field)
+            }
+            TypeDefinition::InputObject(_) => type_def
+                .input_field_by_name(member_name)
+                .map(SchemaMember::InputValue),
+            TypeDefinition::Enum(enum_type) => enum_type
+                .values
+                .iter()
+                .find(|v| v.name == member_name)
+                .map(SchemaMember::EnumValue),
+            _ => None,
+        },
+        (Some(field_name), Some(arg_name), None) => {
+            let field = type_def.field_by_name(field_name)?;
+            field
+                .arguments
+                .iter()
+                .find(|a| a.name == arg_name)
+                .map(SchemaMember::InputValue)
+        }
+        // More than three segments is not a valid schema coordinate.
+        (Some(_), Some(_), Some(_)) => None,
+    }
+}
+
+/// Resolves the `__SchemaDefinition` union for a coordinate against the given
+/// selection set. Returns `Value::Null` when the coordinate cannot be located,
+/// so callers can skip unknown coordinates.
+fn resolve_schema_definition<'exec>(
+    coordinate: &str,
+    selections: &'exec SelectionSet,
+    ctx: &'exec IntrospectionContext,
+) -> Value<'exec> {
+    let Some(member) = locate_member(coordinate, ctx) else {
+        return Value::Null;
+    };
+    let typename = member.typename();
+
+    let mut data: Vec<(&str, Value<'exec>)> = Vec::with_capacity(selections.items.len());
+    for item in &selections.items {
+        match item {
+            // Unions expose no fields directly other than `__typename`.
+            SelectionItem::Field(field) if field.name == "__typename" => {
+                data.push((field.selection_identifier(), Value::String(typename.into())));
+            }
+            SelectionItem::Field(_) => {}
+            SelectionItem::InlineFragment(frag) if frag.type_condition == typename => {
+                let sub = match member {
+                    SchemaMember::Type(td) => {
+                        resolve_type_definition_selections(td, &frag.selections.items, ctx)
+                    }
+                    SchemaMember::Field(fd) => {
+                        resolve_field_selections(fd, &frag.selections.items, ctx)
+                    }
+                    SchemaMember::InputValue(iv) => {
+                        resolve_input_value_selections(iv, &frag.selections.items, ctx)
+                    }
+                    SchemaMember::EnumValue(ev) => {
+                        resolve_enum_value_selections(ev, &frag.selections.items)
+                    }
+                    SchemaMember::Directive(d) => {
+                        resolve_directive_selections(d, &frag.selections.items, ctx)
+                    }
+                };
+                data.extend(sub);
+            }
+            SelectionItem::InlineFragment(_) | SelectionItem::FragmentSpread(_) => {}
+        }
+    }
+    data.sort_by_key(|(k, _)| *k);
+    Value::Object(data)
+}
+
+fn encode_cursor(rank: usize) -> String {
+    // Opaque pagination token; carries the next offset to resume from.
+    (rank + 1).to_string()
+}
+
+fn decode_cursor(cursor: &str) -> Option<usize> {
+    cursor.parse::<usize>().ok()
+}
+
+fn resolve_search<'exec>(
+    field: &'exec FieldSelection,
+    ctx: &'exec IntrospectionContext,
+) -> Value<'exec> {
+    let args = field.arguments.as_ref();
+    let vars = ctx.variables.variables_map.as_ref();
+
+    let query = args
+        .and_then(|a| a.get_argument("query"))
+        .and_then(|v| arg_as_str(v, vars))
+        .unwrap_or("");
+    if query.trim().is_empty() {
+        return Value::Array(Vec::new());
+    }
+
+    let first = args
+        .and_then(|a| a.get_argument("first"))
+        .and_then(|v| arg_as_i64(v, vars))
+        .map(|i| i.max(0) as usize)
+        .unwrap_or(10);
+
+    let after = args
+        .and_then(|a| a.get_argument("after"))
+        .and_then(|v| arg_as_str(v, vars))
+        .and_then(decode_cursor);
+
+    let min_score = args
+        .and_then(|a| a.get_argument("minScore"))
+        .and_then(|v| arg_as_f64(v, vars));
+
+    let opts = SearchOptions {
+        first,
+        after,
+        min_score,
+    };
+
+    let results = ctx
+        .index
+        .search(query, &opts)
+        .into_iter()
+        .map(|hit| {
+            resolve_search_result(hit.coordinate, hit.score, hit.rank, &field.selections, ctx)
+        })
+        .collect();
+
+    Value::Array(results)
+}
+
+fn resolve_search_result<'exec>(
+    coordinate: &'exec str,
+    score: f64,
+    rank: usize,
+    selections: &'exec SelectionSet,
+    ctx: &'exec IntrospectionContext,
+) -> Value<'exec> {
+    let mut data =
+        resolve_search_result_selections(coordinate, score, rank, &selections.items, ctx);
+    data.sort_by_key(|(k, _)| *k);
+    Value::Object(data)
+}
+
+fn resolve_search_result_selections<'exec>(
+    coordinate: &'exec str,
+    score: f64,
+    rank: usize,
+    selection_items: &'exec Vec<SelectionItem>,
+    ctx: &'exec IntrospectionContext,
+) -> Vec<(&'exec str, Value<'exec>)> {
+    let mut data = Vec::with_capacity(selection_items.len());
+    for item in selection_items {
+        if let SelectionItem::Field(field) = item {
+            let value = match field.name.as_str() {
+                "coordinate" => Value::String(coordinate.into()),
+                "score" => Value::F64(score),
+                "cursor" => Value::String(encode_cursor(rank).into()),
+                "pathsToRoot" => {
+                    let paths = ctx
+                        .index
+                        .paths_to_root(coordinate)
+                        .into_iter()
+                        .map(|path| {
+                            Value::Array(
+                                path.into_iter().map(|c| Value::String(c.into())).collect(),
+                            )
+                        })
+                        .collect();
+                    Value::Array(paths)
+                }
+                "definition" => resolve_schema_definition(coordinate, &field.selections, ctx),
+                "__typename" => Value::String("__SearchResult".into()),
+                _ => Value::Null,
+            };
+            data.push((field.selection_identifier(), value));
+        } else if let SelectionItem::InlineFragment(_) = item {
+            if let Some(selection_items) = item.selections() {
+                let sub =
+                    resolve_search_result_selections(coordinate, score, rank, selection_items, ctx);
+                data.extend(sub);
+            }
+        }
+    }
+    data
+}
+
+fn resolve_definitions<'exec>(
+    field: &'exec FieldSelection,
+    ctx: &'exec IntrospectionContext,
+) -> Value<'exec> {
+    let vars = ctx.variables.variables_map.as_ref();
+    let coordinates = field
+        .arguments
+        .as_ref()
+        .and_then(|a| a.get_argument("coordinates"))
+        .and_then(|v| arg_as_str_list(v, vars));
+
+    let Some(coordinates) = coordinates else {
+        return Value::Array(Vec::new());
+    };
+
+    let results = coordinates
+        .iter()
+        // Skip coordinates that don't resolve so the non-null list stays valid.
+        .filter_map(
+            |&coord| match resolve_schema_definition(coord, &field.selections, ctx) {
+                Value::Null => None,
+                value => Some(value),
+            },
+        )
+        .collect();
+
+    Value::Array(results)
+}
+
 pub fn resolve_introspection<'exec>(
     operation_definition: &'exec OperationDefinition,
     ctx: &'exec IntrospectionContext,
@@ -622,11 +887,8 @@ fn resolve_root_introspection_selections<'exec>(
             let value = match field.name.as_str() {
                 "__schema" => resolve_schema_field(field, ctx),
                 // Semantic introspection (`docs/design/semantic-introspection/main.md`).
-                // Phase 0 returns empty lists so the full pipeline (validation,
-                // normalization, partition, projection) can be exercised before
-                // the index and resolvers land.
-                "__search" => Value::Array(Vec::new()),
-                "__definitions" => Value::Array(Vec::new()),
+                "__search" => resolve_search(field, ctx),
+                "__definitions" => resolve_definitions(field, ctx),
                 "__type" => {
                     if let Some(args) = &field.arguments {
                         if let Some(AstValue::String(type_name)) = args.get_argument("name") {

@@ -375,4 +375,166 @@ mod introspection_e2e_tests {
         }
         "#);
     }
+
+    #[ntex::test]
+    async fn semantic_introspection_definitions_by_coordinate() {
+        let router = TestRouter::builder()
+            .inline_config(
+                r#"supergraph:
+                source: file
+                path: "./supergraph-introspection-extended.graphql"
+          "#,
+            )
+            .build()
+            .start()
+            .await;
+
+        let resp = router
+            .send_graphql_request(
+                r#"
+            {
+              __definitions(coordinates: [
+                "Query.testField",
+                "TestInput",
+                "MyScalar",
+                "Query.testField.newArg",
+                "Does.Not.Exist"
+              ]) {
+                __typename
+                # `name` differs in nullability across members (__Type.name: String
+                # vs __Field.name: String!), so alias per member, as a client must.
+                ... on __Type { kind typeName: name }
+                ... on __Field { fieldName: name fieldType: type { name } args { name } }
+                ... on __InputValue { inputName: name inputType: type { name } }
+              }
+            }
+        "#,
+                None,
+                None,
+            )
+            .await;
+
+        assert!(resp.status().is_success(), "Expected 200 OK");
+        insta::assert_snapshot!(resp.json_body_string_pretty_stable().await, @r#"
+        {
+          "data": {
+            "__definitions": [
+              {
+                "__typename": "__Field",
+                "args": [
+                  {
+                    "name": "oldArg"
+                  },
+                  {
+                    "name": "newArg"
+                  }
+                ],
+                "fieldName": "testField",
+                "fieldType": {
+                  "name": "String"
+                }
+              },
+              {
+                "__typename": "__Type",
+                "kind": "INPUT_OBJECT",
+                "typeName": "TestInput"
+              },
+              {
+                "__typename": "__Type",
+                "kind": "SCALAR",
+                "typeName": "MyScalar"
+              },
+              {
+                "__typename": "__InputValue",
+                "inputName": "newArg",
+                "inputType": {
+                  "name": "TestInput"
+                }
+              }
+            ]
+          }
+        }
+        "#);
+    }
+
+    #[ntex::test]
+    async fn semantic_introspection_search_ranks_and_navigates() {
+        let router = TestRouter::builder()
+            .inline_config(
+                r#"supergraph:
+                source: file
+                path: "./supergraph-introspection-extended.graphql"
+          "#,
+            )
+            .build()
+            .start()
+            .await;
+
+        let resp = router
+            .send_graphql_request(
+                r#"
+            {
+              __search(query: "test field", first: 3) {
+                coordinate
+                score
+                cursor
+                pathsToRoot
+                definition {
+                  __typename
+                  ... on __Field { fieldName: name }
+                  ... on __Type { kind typeName: name }
+                }
+              }
+            }
+        "#,
+                None,
+                None,
+            )
+            .await;
+
+        assert!(resp.status().is_success(), "Expected 200 OK");
+
+        // Redact the BM25 score values (the top hit normalizes to 1.0; lower
+        // ranks are score-dependent and asserted in the index unit tests). The
+        // ranking *order*, coordinates, cursors, paths and union dispatch below
+        // are deterministic.
+        let body = resp.json_body_string_pretty_stable().await;
+        let mut settings = insta::Settings::clone_current();
+        settings.add_filter(r#""score": [0-9.]+"#, r#""score": "[score]""#);
+        settings.bind(|| {
+            insta::assert_snapshot!(body, @r#"
+            {
+              "data": {
+                "__search": [
+                  {
+                    "coordinate": "TestInput",
+                    "cursor": "1",
+                    "definition": {
+                      "__typename": "__Type",
+                      "kind": "INPUT_OBJECT",
+                      "typeName": "TestInput"
+                    },
+                    "pathsToRoot": [],
+                    "score": "[score]"
+                  },
+                  {
+                    "coordinate": "Query.testField",
+                    "cursor": "2",
+                    "definition": {
+                      "__typename": "__Field",
+                      "fieldName": "testField"
+                    },
+                    "pathsToRoot": [
+                      [
+                        "Query.testField"
+                      ]
+                    ],
+                    "score": "[score]"
+                  }
+                ]
+              }
+            }
+            "#);
+        });
+    }
 }
