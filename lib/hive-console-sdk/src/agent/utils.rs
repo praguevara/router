@@ -839,19 +839,40 @@ impl OperationProcessor {
             .map_err(|e| e.to_string())?
             .into_static();
 
-        let is_introspection = parsed.definitions.iter().find(|def| match def {
-            Definition::Operation(OperationDefinition::Query(query)) => query
-                .selection_set
+        // Skip operations that target reserved (`__`-prefixed) root meta-fields:
+        // built-in introspection (`__schema`/`__type`) and router-resolved
+        // meta-fields such as `__search`/`__definitions`. Their response types are
+        // not part of the registered schema, so coordinate extraction cannot
+        // resolve them and would otherwise drop the whole operation with a
+        // PROCESSING error ("Unable to find parent type of ..."). `__typename` is
+        // intentionally excluded — clients routinely add it to normal operations,
+        // and skipping those would lose legitimate usage data.
+        let targets_reserved_meta_field = |selection_set: &SelectionSet<'static, String>| {
+            selection_set
                 .items
                 .iter()
                 .any(|selection| match selection {
-                    Selection::Field(field) => field.name == "__schema" || field.name == "__type",
+                    Selection::Field(field) => {
+                        field.name.starts_with("__") && field.name != "__typename"
+                    }
                     _ => false,
-                }),
+                })
+        };
+        let is_meta_operation = parsed.definitions.iter().find(|def| match def {
+            Definition::Operation(OperationDefinition::Query(query)) => {
+                targets_reserved_meta_field(&query.selection_set)
+            }
+            // Anonymous shorthand operations (`{ __search ... }`) parse to the
+            // `SelectionSet` variant rather than `Query`, so they must be checked
+            // too — otherwise shorthand introspection falls through to coordinate
+            // extraction and is dropped with a PROCESSING error.
+            Definition::Operation(OperationDefinition::SelectionSet(selection_set)) => {
+                targets_reserved_meta_field(selection_set)
+            }
             _ => false,
         });
 
-        if is_introspection.is_some() {
+        if is_meta_operation.is_some() {
             return Ok(None);
         }
 
@@ -881,6 +902,7 @@ mod tests {
     use graphql_tools::parser::parse_schema;
 
     use super::collect_schema_coordinates;
+    use super::OperationProcessor;
 
     const SCHEMA_SDL: &str = "
         type Query {
@@ -1006,6 +1028,50 @@ mod tests {
 
         assert_eq!(extra.len(), 0, "Extra: {:?}", extra);
         assert_eq!(missing.len(), 0, "Missing: {:?}", missing);
+    }
+
+    #[test]
+    fn skips_reserved_root_meta_fields() {
+        let schema = parse_schema::<String>(SCHEMA_SDL).unwrap();
+        let processor = OperationProcessor::new();
+
+        // Built-in introspection plus router-resolved meta-fields, in both named
+        // and anonymous-shorthand form. None of these resolve against the
+        // registered schema, so they must be skipped rather than dropped with a
+        // PROCESSING error.
+        for query in [
+            "query Introspection { __schema { queryType { name } } }",
+            r#"query SemanticSearch($q: String!) { __search(query: $q, first: 5) { coordinate score } }"#,
+            r#"query SemanticDefinitions($c: [String!]!) { __definitions(coordinates: $c) { __typename } }"#,
+            // Anonymous shorthand operations (the `SelectionSet` AST variant).
+            "{ __schema { queryType { name } } }",
+            r#"{ __search(query: "taxis", first: 5) { coordinate } }"#,
+        ] {
+            let result = processor.process(query, &schema).unwrap();
+            assert!(result.is_none(), "expected skip for: {query}");
+        }
+    }
+
+    #[test]
+    fn reports_normal_operation_with_root_typename() {
+        let schema = parse_schema::<String>(SCHEMA_SDL).unwrap();
+        let processor = OperationProcessor::new();
+
+        // A root-level `__typename` is common in client operations and must NOT
+        // cause the whole operation to be skipped.
+        let result = processor
+            .process(
+                "query Projects($s: ProjectSelectorInput!) { __typename project(selector: $s) { name } }",
+                &schema,
+            )
+            .unwrap()
+            .expect("operation with a real field should be reported");
+
+        assert!(
+            result.coordinates.contains(&"Query.project".to_string()),
+            "expected Query.project in {:?}",
+            result.coordinates
+        );
     }
 
     #[test]

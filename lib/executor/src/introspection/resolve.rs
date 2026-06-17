@@ -14,7 +14,9 @@ use hive_router_query_planner::ast::{
     value::Value as AstValue,
 };
 use hive_router_query_planner::state::supergraph_state::OperationKind;
+use sonic_rs::{JsonContainerTrait, JsonValueTrait};
 
+use crate::execution::plan::{CoerceVariablesPayload, VariablesMap};
 use crate::introspection::schema::SchemaMetadata;
 use crate::introspection::semantic::{SearchOptions, SemanticSearchProvider};
 use crate::response::value::Value;
@@ -720,6 +722,60 @@ fn encode_cursor(rank: usize) -> String {
 
 fn decode_cursor(cursor: &str) -> Option<usize> {
     cursor.parse::<usize>().ok()
+}
+
+/// Reads a meta-field argument as a string, following a `$var` reference into
+/// the coerced variables map. Returns `None` if the argument is neither a string
+/// literal nor a variable bound to a string.
+fn arg_as_str<'a>(value: &'a AstValue, vars: Option<&'a VariablesMap>) -> Option<&'a str> {
+    match value {
+        AstValue::String(s) => Some(s.as_str()),
+        AstValue::Variable(name) => vars?.get(name)?.as_str(),
+        _ => None,
+    }
+}
+
+/// Reads a meta-field argument as an integer, following a `$var` reference.
+fn arg_as_i64(value: &AstValue, vars: Option<&VariablesMap>) -> Option<i64> {
+    match value {
+        AstValue::Int(i) => Some(*i),
+        AstValue::Variable(name) => vars?.get(name)?.as_i64(),
+        _ => None,
+    }
+}
+
+/// Reads a meta-field argument as a float, following a `$var` reference. Integer
+/// values are widened, matching GraphQL's `Int`-to-`Float` input coercion.
+fn arg_as_f64(value: &AstValue, vars: Option<&VariablesMap>) -> Option<f64> {
+    match value {
+        AstValue::Float(f) => Some(*f),
+        AstValue::Int(i) => Some(*i as f64),
+        AstValue::Variable(name) => {
+            let v = vars?.get(name)?;
+            v.as_f64().or_else(|| v.as_i64().map(|i| i as f64))
+        }
+        _ => None,
+    }
+}
+
+/// Reads a meta-field argument as a list of strings. Handles both a whole-list
+/// variable (`coordinates: $coords`) and an inline list whose elements may
+/// themselves be variables (`coordinates: [$a, "B"]`). Non-string elements are
+/// skipped.
+fn arg_as_str_list<'a>(value: &'a AstValue, vars: Option<&'a VariablesMap>) -> Option<Vec<&'a str>> {
+    match value {
+        AstValue::List(items) => Some(
+            items
+                .iter()
+                .filter_map(|item| arg_as_str(item, vars))
+                .collect(),
+        ),
+        AstValue::Variable(name) => {
+            let arr = vars?.get(name)?.as_array()?;
+            Some(arr.iter().filter_map(|e| e.as_str()).collect())
+        }
+        _ => None,
+    }
 }
 
 async fn resolve_search<'exec>(

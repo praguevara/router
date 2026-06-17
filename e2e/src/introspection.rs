@@ -543,6 +543,117 @@ semantic_introspection:
     }
 
     #[ntex::test]
+    async fn semantic_introspection_search_resolves_variable_arguments() {
+        // Regression: `__search` is resolved on the router against the query AST
+        // (it is not federated), so variable references in its arguments must be
+        // read from the coerced variables map. A spec-valid
+        // `__search(query: $q, first: $first)` must behave identically to inlining
+        // the literals — previously the resolver only matched literals, so a
+        // variable silently fell through to an empty query and returned `[]`.
+        let router = TestRouter::builder()
+            .inline_config(
+                r#"supergraph:
+                source: file
+                path: "./supergraph-introspection-extended.graphql"
+semantic_introspection:
+                enabled: true
+          "#,
+            )
+            .build()
+            .start()
+            .await;
+
+        let resp = router
+            .send_graphql_request(
+                r#"
+            query Search($q: String!, $first: Int!) {
+              __search(query: $q, first: $first) {
+                coordinate
+                cursor
+              }
+            }
+        "#,
+                Some(sonic_rs::json!({ "q": "test field", "first": 3 })),
+                None,
+            )
+            .await;
+
+        assert!(resp.status().is_success(), "Expected 200 OK");
+        // Identical to the literal `__search(query: "test field", first: 3)` hits.
+        insta::assert_snapshot!(resp.json_body_string_pretty_stable().await, @r#"
+        {
+          "data": {
+            "__search": [
+              {
+                "coordinate": "TestInput",
+                "cursor": "1"
+              },
+              {
+                "coordinate": "Query.testField",
+                "cursor": "2"
+              }
+            ]
+          }
+        }
+        "#);
+    }
+
+    #[ntex::test]
+    async fn semantic_introspection_definitions_resolves_variable_coordinates() {
+        // Regression companion for `__definitions`: the `coordinates` list must be
+        // readable both as a whole-list variable (`coordinates: $coords`) and as an
+        // inline list whose elements are variables. Previously only an inline list
+        // of string literals resolved; a variable returned `[]`.
+        let router = TestRouter::builder()
+            .inline_config(
+                r#"supergraph:
+                source: file
+                path: "./supergraph-introspection-extended.graphql"
+semantic_introspection:
+                enabled: true
+          "#,
+            )
+            .build()
+            .start()
+            .await;
+
+        let resp = router
+            .send_graphql_request(
+                r#"
+            query Defs($coords: [String!]!) {
+              __definitions(coordinates: $coords) {
+                __typename
+                ... on __Type { kind typeName: name }
+                ... on __Field { fieldName: name }
+              }
+            }
+        "#,
+                Some(sonic_rs::json!({ "coords": ["Query.testField", "MyScalar"] })),
+                None,
+            )
+            .await;
+
+        assert!(resp.status().is_success(), "Expected 200 OK");
+        insta::assert_snapshot!(resp.json_body_string_pretty_stable().await, @r#"
+        {
+          "data": {
+            "__definitions": [
+              {
+                "__typename": "__Field",
+                "fieldName": "testField"
+              },
+              {
+                "__typename": "__Type",
+                "kind": "SCALAR",
+                "typeName": "MyScalar"
+              }
+            ]
+          }
+        }
+        "#);
+    }
+
+    #[ntex::test]
     async fn semantic_introspection_supports_a_custom_provider() {
         // A plugin can replace the default BM25 index with any
         // `SemanticSearchProvider` (here a stub standing in for an API- or
