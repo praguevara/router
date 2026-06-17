@@ -18,11 +18,11 @@ mod tokenize;
 
 use std::cmp::Ordering;
 
-use ahash::HashMap;
 use graphql_tools::static_graphql::schema::{Definition, Document, Field, TypeDefinition};
 
 use crate::introspection::schema::SchemaMetadata;
 use bm25::{Bm25Builder, Bm25Index};
+pub use paths::PathIndex;
 use tokenize::tokenize;
 
 /// Options for a [`SemanticSearchProvider::search`] call, mapped from the `__search`
@@ -62,6 +62,27 @@ pub struct SearchHit {
 /// A pluggable semantic-search backend. Held behind an
 /// `Arc<dyn SemanticSearchProvider>` in `SupergraphData`; the default
 /// implementation is [`Bm25Provider`].
+///
+/// A plugin can replace the backend in its `on_supergraph_reload` end hook,
+/// building from the consumer schema and swapping the index in place. `search`
+/// is async, so a provider may call out to an external search API or vector
+/// store per query. Use [`PathIndex`] for `paths_to_root` rather than
+/// reimplementing the traversal:
+///
+/// ```ignore
+/// fn on_supergraph_reload<'a>(
+///     &'a self,
+///     start: OnSupergraphLoadStartHookPayload,
+/// ) -> OnSupergraphLoadStartHookResult<'a> {
+///     start.on_end(|mut payload| {
+///         let sd = &mut payload.new_supergraph_data;
+///         let paths = PathIndex::build(&sd.metadata, &["Query", "Mutation", "Subscription"]);
+///         sd.semantic_index =
+///             Arc::new(MyProvider::new(&sd.planner.consumer_schema.document, paths));
+///         payload.proceed()
+///     })
+/// }
+/// ```
 #[async_trait::async_trait]
 pub trait SemanticSearchProvider: Send + Sync {
     /// Returns ranked hits for a natural-language `query`, ordered by score
@@ -80,8 +101,8 @@ pub struct Bm25Provider {
     /// Document index -> schema coordinate (parallel to the BM25 corpus).
     coordinates: Vec<String>,
     bm25: Bm25Index,
-    /// Type name -> shortest field-coordinate path from a root type.
-    type_shortest_path: HashMap<String, Vec<String>>,
+    /// Shortest field-coordinate paths from a root type to each reachable type.
+    paths: PathIndex,
 }
 
 impl Bm25Provider {
@@ -159,12 +180,12 @@ impl Bm25Provider {
         if let Some(s) = schema.subscription_type_name() {
             roots.push(s);
         }
-        let type_shortest_path = paths::build_paths_to_root(metadata, &roots);
+        let paths = PathIndex::build(metadata, &roots);
 
         Self {
             coordinates,
             bm25: builder.build(),
-            type_shortest_path,
+            paths,
         }
     }
 }
@@ -224,23 +245,7 @@ impl SemanticSearchProvider for Bm25Provider {
     }
 
     fn paths_to_root(&self, coordinate: &str) -> Vec<Vec<String>> {
-        if let Some((parent, _field)) = coordinate.split_once('.') {
-            // Field coordinate: path to the parent type, then the field itself.
-            match self.type_shortest_path.get(parent) {
-                Some(base) => {
-                    let mut path = base.clone();
-                    path.push(coordinate.to_string());
-                    vec![path]
-                }
-                None => Vec::new(),
-            }
-        } else {
-            // Type coordinate: the navigation path to the type (empty for roots).
-            match self.type_shortest_path.get(coordinate) {
-                Some(path) if !path.is_empty() => vec![path.clone()],
-                _ => Vec::new(),
-            }
-        }
+        self.paths.paths_to_root(coordinate)
     }
 }
 

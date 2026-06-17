@@ -82,6 +82,78 @@ pub fn build_paths_to_root(
     shortest
 }
 
+/// A reusable index of shortest field-coordinate paths from the root operation
+/// types to each reachable type.
+///
+/// Custom [`SemanticSearchProvider`](crate::introspection::semantic::SemanticSearchProvider)
+/// implementations can build this once (e.g. in `on_supergraph_reload`) and
+/// delegate their `paths_to_root` to it instead of reimplementing the traversal.
+#[derive(Debug, Default, Clone)]
+pub struct PathIndex {
+    /// Type name -> shortest field-coordinate path from a root type.
+    type_shortest_path: HashMap<String, Vec<String>>,
+    /// Field coordinates (`T.f`) that actually exist on a reachable type, so a
+    /// field path is only built for a real field rather than fabricated for any
+    /// `<reachableType>.<anything>`.
+    field_coordinates: HashSet<String>,
+}
+
+impl PathIndex {
+    /// Builds the index by BFS over the field graph in `metadata`, starting from
+    /// `roots` (the schema's root operation type names, e.g.
+    /// `Query`/`Mutation`/`Subscription`).
+    pub fn build(metadata: &SchemaMetadata, roots: &[&str]) -> Self {
+        let type_shortest_path = build_paths_to_root(metadata, roots);
+
+        // Record the field coordinates of every reachable type so `paths_to_root`
+        // can distinguish a real field from a bogus one.
+        let mut field_coordinates: HashSet<String> = HashSet::default();
+        for type_name in type_shortest_path.keys() {
+            if let Some(fields) = metadata.get_type_fields(type_name) {
+                for field_name in fields.keys() {
+                    if field_name.starts_with("__") {
+                        continue;
+                    }
+                    field_coordinates.insert(format!("{type_name}.{field_name}"));
+                }
+            }
+        }
+
+        Self {
+            type_shortest_path,
+            field_coordinates,
+        }
+    }
+
+    /// Returns the shortest field-coordinate paths from a root type to
+    /// `coordinate`, or an empty list when none exist. For a field coordinate
+    /// `T.f` this is `shortestPathTo(T) ++ ["T.f"]`; for a type coordinate it is
+    /// the navigation path to the type (empty for root types).
+    pub fn paths_to_root(&self, coordinate: &str) -> Vec<Vec<String>> {
+        if let Some((parent, _field)) = coordinate.split_once('.') {
+            // Field coordinate: path to the parent type, then the field itself —
+            // only when the field actually exists on a reachable type.
+            if !self.field_coordinates.contains(coordinate) {
+                return Vec::new();
+            }
+            match self.type_shortest_path.get(parent) {
+                Some(base) => {
+                    let mut path = base.clone();
+                    path.push(coordinate.to_string());
+                    vec![path]
+                }
+                None => Vec::new(),
+            }
+        } else {
+            // Type coordinate: the navigation path to the type (empty for roots).
+            match self.type_shortest_path.get(coordinate) {
+                Some(path) if !path.is_empty() => vec![path.clone()],
+                _ => Vec::new(),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

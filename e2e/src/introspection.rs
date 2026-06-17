@@ -543,6 +543,124 @@ semantic_introspection:
     }
 
     #[ntex::test]
+    async fn semantic_introspection_supports_a_custom_provider() {
+        // A plugin can replace the default BM25 index with any
+        // `SemanticSearchProvider` (here a stub standing in for an API- or
+        // vector-backed backend) by swapping `semantic_index` in the
+        // `on_supergraph_reload` end hook. This proves the injection seam without
+        // any hook changes.
+        use std::sync::Arc;
+
+        use hive_router::{
+            async_trait,
+            plugins::hooks::on_plugin_init::{OnPluginInitPayload, OnPluginInitResult},
+            plugins::hooks::on_supergraph_load::{
+                OnSupergraphLoadStartHookPayload, OnSupergraphLoadStartHookResult,
+            },
+            plugins::plugin_trait::{EndHookPayload, RouterPlugin, StartHookPayload},
+        };
+        use hive_router_plan_executor::introspection::semantic::{
+            PathIndex, SearchHit, SearchOptions, SemanticSearchProvider,
+        };
+
+        /// Ignores the query and always returns one fixed coordinate, so a
+        /// non-empty result can only come from this provider (plain BM25 returns
+        /// nothing for the query below).
+        struct StubProvider {
+            paths: PathIndex,
+        }
+
+        #[async_trait]
+        impl SemanticSearchProvider for StubProvider {
+            async fn search(&self, _query: &str, _opts: &SearchOptions) -> Vec<SearchHit> {
+                vec![SearchHit {
+                    coordinate: "Query.testField".to_string(),
+                    score: 1.0,
+                    rank: 0,
+                }]
+            }
+
+            fn paths_to_root(&self, coordinate: &str) -> Vec<Vec<String>> {
+                self.paths.paths_to_root(coordinate)
+            }
+        }
+
+        #[derive(Default)]
+        struct StubProviderPlugin;
+
+        #[async_trait]
+        impl RouterPlugin for StubProviderPlugin {
+            type Config = ();
+
+            fn plugin_name() -> &'static str {
+                "stub_semantic_provider"
+            }
+
+            fn on_plugin_init(payload: OnPluginInitPayload<Self>) -> OnPluginInitResult<Self> {
+                payload.initialize_plugin_with_defaults()
+            }
+
+            fn on_supergraph_reload<'exec>(
+                &'exec self,
+                start: OnSupergraphLoadStartHookPayload,
+            ) -> OnSupergraphLoadStartHookResult<'exec> {
+                start.on_end(|mut payload| {
+                    let sd = &mut payload.new_supergraph_data;
+                    let paths =
+                        PathIndex::build(&sd.metadata, &["Query", "Mutation", "Subscription"]);
+                    let provider: Arc<dyn SemanticSearchProvider> =
+                        Arc::new(StubProvider { paths });
+                    sd.semantic_index = provider;
+                    payload.proceed()
+                })
+            }
+        }
+
+        let router = TestRouter::builder()
+            .inline_config(
+                r#"supergraph:
+                source: file
+                path: "./supergraph-introspection-extended.graphql"
+semantic_introspection:
+                enabled: true
+plugins:
+                stub_semantic_provider:
+                  enabled: true
+          "#,
+            )
+            .register_plugin::<StubProviderPlugin>()
+            .build()
+            .start()
+            .await;
+
+        let resp = router
+            .send_graphql_request(
+                r#"{ __search(query: "zzznomatch") { coordinate pathsToRoot } }"#,
+                None,
+                None,
+            )
+            .await;
+
+        assert!(resp.status().is_success(), "Expected 200 OK");
+        insta::assert_snapshot!(resp.json_body_string_pretty_stable().await, @r#"
+        {
+          "data": {
+            "__search": [
+              {
+                "coordinate": "Query.testField",
+                "pathsToRoot": [
+                  [
+                    "Query.testField"
+                  ]
+                ]
+              }
+            ]
+          }
+        }
+        "#);
+    }
+
+    #[ntex::test]
     async fn semantic_introspection_disabled_by_default() {
         // No `semantic_introspection.enabled`, so the feature is off by default.
         let router = TestRouter::builder()

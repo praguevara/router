@@ -130,9 +130,8 @@ Consequences of making `search` async:
 The plugin customizes the index in the **end hook** of `on_supergraph_reload`, which already
 receives `new_supergraph_data: SupergraphData` (`pub`, mutable):
 
-1. Build inputs — the consumer-schema document and `SchemaMetadata` — must be reachable from
-   `new_supergraph_data` (metadata is already `pub`; expose the consumer-schema document if it
-   isn't already).
+1. Build inputs are reachable from `new_supergraph_data`: `metadata` (`Arc<SchemaMetadata>`) and
+   `planner.consumer_schema.document` (`Arc<Document>`), both `pub`.
 2. The plugin constructs its provider (a customized `Bm25Provider` for Layer 1, or any
    `dyn SemanticSearchProvider` for Layer 2) and assigns
    `new_supergraph_data.semantic_index = Arc::new(provider)`.
@@ -165,11 +164,18 @@ open (D2 below).
 
 ## Suggested phasing
 
-- **2a — provider trait, no behavior change.** Extract `Bm25Provider: SemanticSearchProvider`
-  from today's `SemanticIndex`; make `search` async; store `Arc<dyn …>` in `SupergraphData`;
-  thread `.await` through the resolve chain; switch `SearchHit` to owned. Default identical.
-- **2b — Layer 1 customization.** Public `Bm25Provider` builder (synonyms/weights/exclusions/
-  tokenizer); a plugin wires it via the `on_supergraph_reload` end hook.
+- **2a — provider trait, no behavior change. ✅ Done.** Extracted
+  `Bm25Provider: SemanticSearchProvider` from `SemanticIndex`; `search` is async;
+  `Arc<dyn …>` in `SupergraphData`; `.await` threaded through the resolve chain; `SearchHit`
+  owned. Default identical.
+- **2b — generic provider injection (minimal seam). ✅ Done.** Confirmed injection needs **no
+  hook change**: a plugin swaps `new_supergraph_data.semantic_index` (a `pub` field) in the
+  `on_supergraph_reload` end hook (payload passed by value). Exposed `PathIndex` (build +
+  `paths_to_root`) — the one reusable building block a custom API/vector/BM25 provider needs;
+  `Bm25Provider` now uses it. Proven by an e2e test that installs a non-BM25 stub provider.
+  **Deferred:** BM25 corpus tuning (synonyms/weights/exclude) and corpus-enumeration /
+  hit-normalization helpers — a custom provider reads `&Document` + `&SchemaMetadata` directly
+  and owns its score/cursor semantics.
 - **2c — Layer 3 auth-aware filtering.** Result hook / context + auth plumbing.
 - **2d — embedding / external-service provider.** A concrete backend behind the trait;
   provisioning per D3.
