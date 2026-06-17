@@ -72,6 +72,12 @@ use hive_router_internal::{
 pub use hive_router_plan_executor::execution::plan::PlanExecutionOutput;
 pub use hive_router_plan_executor::executors::http::SubgraphHttpResponse;
 use hive_router_plan_executor::headers::response::ResponseHeaderSink;
+// Semantic-introspection search backend, re-exported so downstream plugins can
+// implement and install a custom `SemanticSearchProvider` (e.g. via the
+// `on_supergraph_reload` hook) and reuse `PathIndex` for `paths_to_root`.
+pub use hive_router_plan_executor::introspection::semantic::{
+    Bm25Provider, PathIndex, SearchHit, SearchOptions, SemanticSearchProvider,
+};
 pub use hive_router_plan_executor::response::graphql_error::GraphQLError;
 pub use hive_router_query_planner as query_planner;
 pub use http;
