@@ -502,6 +502,11 @@ semantic_introspection:
         // ranks are score-dependent and asserted in the index unit tests). The
         // ranking *order*, coordinates, cursors, paths and union dispatch below
         // are deterministic.
+        //
+        // `Query.testField` (a field one hop from the root) outranks the
+        // textually-similar `TestInput` (an input type, unreachable by field
+        // navigation) because of depth boosting — shallower coordinates are
+        // favored.
         let body = resp.json_body_string_pretty_stable().await;
         let mut settings = insta::Settings::clone_current();
         settings.add_filter(r#""score": [0-9.]+"#, r#""score": "[score]""#);
@@ -511,19 +516,8 @@ semantic_introspection:
               "data": {
                 "__search": [
                   {
-                    "coordinate": "TestInput",
-                    "cursor": "1",
-                    "definition": {
-                      "__typename": "__Type",
-                      "kind": "INPUT_OBJECT",
-                      "typeName": "TestInput"
-                    },
-                    "pathsToRoot": [],
-                    "score": "[score]"
-                  },
-                  {
                     "coordinate": "Query.testField",
-                    "cursor": "2",
+                    "cursor": "1",
                     "definition": {
                       "__typename": "__Field",
                       "fieldName": "testField"
@@ -533,6 +527,17 @@ semantic_introspection:
                         "Query.testField"
                       ]
                     ],
+                    "score": "[score]"
+                  },
+                  {
+                    "coordinate": "TestInput",
+                    "cursor": "2",
+                    "definition": {
+                      "__typename": "__Type",
+                      "kind": "INPUT_OBJECT",
+                      "typeName": "TestInput"
+                    },
+                    "pathsToRoot": [],
                     "score": "[score]"
                   }
                 ]
@@ -585,11 +590,11 @@ semantic_introspection:
           "data": {
             "__search": [
               {
-                "coordinate": "TestInput",
+                "coordinate": "Query.testField",
                 "cursor": "1"
               },
               {
-                "coordinate": "Query.testField",
+                "coordinate": "TestInput",
                 "cursor": "2"
               }
             ]

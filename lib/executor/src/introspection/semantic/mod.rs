@@ -100,6 +100,9 @@ pub trait SemanticSearchProvider: Send + Sync {
 pub struct Bm25Provider {
     /// Document index -> schema coordinate (parallel to the BM25 corpus).
     coordinates: Vec<String>,
+    /// Document index -> depth from the nearest root type (parallel to the BM25
+    /// corpus). Used to boost shallower, closer-to-root results in ranking.
+    depths: Vec<u16>,
     bm25: Bm25Index,
     /// Shortest field-coordinate paths from a root type to each reachable type.
     paths: PathIndex,
@@ -182,8 +185,27 @@ impl Bm25Provider {
         }
         let paths = PathIndex::build(metadata, &roots);
 
+        // Depth per coordinate, parallel to the corpus, for ranking. Coordinates
+        // unreachable by field navigation (input types, etc.) have no depth; sink
+        // them just below the deepest reachable coordinate rather than dropping
+        // them, so they stay findable but never outrank navigable content.
+        let raw_depths: Vec<Option<u16>> =
+            coordinates.iter().map(|c| paths.depth(c)).collect();
+        let unreachable_depth = raw_depths
+            .iter()
+            .flatten()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let depths: Vec<u16> = raw_depths
+            .into_iter()
+            .map(|d| d.unwrap_or(unreachable_depth))
+            .collect();
+
         Self {
             coordinates,
+            depths,
             bm25: builder.build(),
             paths,
         }
@@ -207,6 +229,14 @@ impl SemanticSearchProvider for Bm25Provider {
         let mut scored = self.bm25.score(&terms);
         if scored.is_empty() {
             return Vec::new();
+        }
+
+        // Boost shallower results: divide the raw BM25 score by `2.0 + depth` so
+        // a field one hop from a root outranks an equally-textually-relevant field
+        // buried deep in the graph. Applied before normalization, so the top hit
+        // still normalizes to 1.0.
+        for (doc, raw) in scored.iter_mut() {
+            *raw /= 2.0 + self.depths[*doc] as f64;
         }
 
         // Sort by score descending; break ties on coordinate for deterministic,

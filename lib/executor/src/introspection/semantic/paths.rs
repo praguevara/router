@@ -125,6 +125,26 @@ impl PathIndex {
         }
     }
 
+    /// Returns the depth of `coordinate` from the nearest root type: `0` for a
+    /// root type, `n` for a type reached by `n` field hops, and `parentDepth + 1`
+    /// for a field coordinate. Returns `None` when the coordinate is unreachable
+    /// from any root (e.g. an input type, or a non-existent field). Useful for
+    /// boosting shallower (closer-to-root) results in ranking.
+    pub fn depth(&self, coordinate: &str) -> Option<u16> {
+        if let Some((parent, _field)) = coordinate.split_once('.') {
+            if !self.field_coordinates.contains(coordinate) {
+                return None;
+            }
+            self.type_shortest_path
+                .get(parent)
+                .map(|path| path.len() as u16 + 1)
+        } else {
+            self.type_shortest_path
+                .get(coordinate)
+                .map(|path| path.len() as u16)
+        }
+    }
+
     /// Returns the shortest field-coordinate paths from a root type to
     /// `coordinate`, or an empty list when none exist. For a field coordinate
     /// `T.f` this is `shortestPathTo(T) ++ ["T.f"]`; for a type coordinate it is
@@ -225,6 +245,19 @@ mod tests {
                 "Area.availableTaxis".to_string()
             ]]
         );
+    }
+
+    #[test]
+    fn depth_is_zero_at_root_and_grows_with_distance() {
+        let index = PathIndex::build(&metadata(), &["Query"]);
+        assert_eq!(index.depth("Query"), Some(0)); // root type
+        assert_eq!(index.depth("Query.areaByName"), Some(1)); // field on root
+        assert_eq!(index.depth("Area"), Some(1)); // reached in one hop
+        assert_eq!(index.depth("Area.availableTaxis"), Some(2)); // field one hop deeper
+        assert_eq!(index.depth("Station"), Some(2)); // reached in two hops
+        // Unreachable / non-existent coordinates have no depth.
+        assert_eq!(index.depth("Unknown"), None);
+        assert_eq!(index.depth("Area.doesNotExist"), None);
     }
 
     #[test]
