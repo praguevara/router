@@ -1,3 +1,55 @@
+## 0.0.31 (2026-06-19)
+
+### Fixes
+
+#### Make the subscription subgraph executor buffer capacity configurable
+
+When a subscription is established, the router reads events from the subgraph (over HTTP streaming or WebSocket) and runs each one through entity resolution before fanning it out to listeners. A per-subscription buffer sits between the subgraph and that processing pipeline so the subgraph is never throttled when the router falls behind. When the buffer is full, the newest incoming event is dropped (and logged) instead of slowing down or tearing down the connection to the subgraph.
+
+The size of this buffer is now configurable via `subscriptions.subgraph_buffer_capacity`. A larger capacity gives the router more headroom to absorb bursts at the cost of memory and potentially staler events under sustained backpressure; a smaller capacity keeps memory minimal and drops eagerly. It defaults to `1024`, favoring high throughput.
+
+```yaml
+subscriptions:
+  enabled: true
+  subgraph_buffer_capacity: 1024 # default
+```
+
+## 0.0.30 (2026-06-18)
+
+### Fixes
+
+#### Mark failed subgraph HTTP requests as errors on their trace span
+
+When an outgoing subgraph HTTP request failed at the transport level (connection error, timeout, body read failure, etc.), the `http.client` span was left with an unset `otel.status_code`, so the failure was not surfaced as an error in traces (e.g. Datadog). The error was only recorded in metrics. The span is now marked with `otel.status_code = "Error"` and the corresponding `error.type` on the failure path, matching the existing metrics behaviour.
+
+## 0.0.29 (2026-06-17)
+
+### Fixes
+
+#### Add an experimental query planner option, `experimental_abstract_type_folding`
+
+```yaml
+query_planner:
+    experimental_abstract_type_folding: true # false by default
+```
+
+Folds matching concrete object-type fragments in subgraph calls, into a shared interface fragment even when that interface is not the field's declared return type.
+
+It's an opt-in addition to [`011be5b`](https://github.com/graphql-hive/router/commit/011be5bdbfb00bf1e415eb7a50e6be91f565ef05).
+
+```diff
+## queries `product-service` subgraph
+query {
+  products {
+-    ... on Book  { id title }
+-    ... on Movie { id title }
++    ... on Media { id title }
+  }
+}
+```
+
+The `products` field returns `Product` interface, but one object-type member of this interface called `Album` is not present in the query, therefore `... on Product {...}` is not possible to use (default behavior). With the feature flag enabled, both fragments are folded into `... on Media { ... }`, because `Book` and `Movie` are the only members of the `Media` interface in the `product-service` subgraph.
+
 ## 0.0.28 (2026-06-15)
 
 ### Features

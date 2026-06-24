@@ -116,6 +116,122 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Other
 
 - *(deps)* update release-plz/action action to v0.5.113 ([#389](https://github.com/graphql-hive/router/pull/389))
+## 0.0.72 (2026-06-19)
+
+### Fixes
+
+#### Make the subscription subgraph executor buffer capacity configurable
+
+When a subscription is established, the router reads events from the subgraph (over HTTP streaming or WebSocket) and runs each one through entity resolution before fanning it out to listeners. A per-subscription buffer sits between the subgraph and that processing pipeline so the subgraph is never throttled when the router falls behind. When the buffer is full, the newest incoming event is dropped (and logged) instead of slowing down or tearing down the connection to the subgraph.
+
+The size of this buffer is now configurable via `subscriptions.subgraph_buffer_capacity`. A larger capacity gives the router more headroom to absorb bursts at the cost of memory and potentially staler events under sustained backpressure; a smaller capacity keeps memory minimal and drops eagerly. It defaults to `1024`, favoring high throughput.
+
+```yaml
+subscriptions:
+  enabled: true
+  subgraph_buffer_capacity: 1024 # default
+```
+
+#### Decouple HTTP streaming subscriptions from downstream backpressure
+
+When a subscription's events flow through the router, each event is run through entity resolution (fetching the related data from other subgraphs) before being delivered to the client. If that resolution is slow, or the client is slow to consume, the router would previously stop reading from the subscribing subgraph until it caught up. That stall propagates back over the connection and effectively throttles the subgraph's emitter.
+
+HTTP streaming subscriptions (multipart and SSE) now buffer incoming events and drain them from the subgraph at full speed, independent of how fast the router can process them. If the router cannot keep up, the newest incoming event is dropped (and logged) instead of slowing the subgraph.
+
+The subscription stays alive and the subgraph keeps emitting unaffected.
+
+#### Keep WebSocket subgraph subscriptions alive under backpressure
+
+Each subscription event the router receives is run through entity resolution (fetching related data from other subgraphs) before reaching the client. When that resolution has higher latency than the rate at which the subgraph emits events, the router falls behind and backpressure builds up.
+
+The WebSocket subgraph executor now drops individual messages it cannot keep up with instead of tearing down the subscription, keeping the underlying connection to the subgraph open. The dropped messages are logged, and the subgraph continues emitting without being throttled by the router's processing speed.
+
+## 0.0.71 (2026-06-18)
+
+### Fixes
+
+#### Fix null propagation in non-null fields
+
+This change fixes the null propagation logic in non-null fields to match the spec.
+
+From the GraphQL spec:
+
+> Since Non-Null response positions cannot be null, execution errors are propagated to be handled by the parent response position. If the parent response position may be null then it resolves to null, otherwise if it is a Non-Null type, the execution error is further propagated to its parent response position.
+> If a List type wraps a Non-Null type, and one of the response position elements of that list resolves to null, then the entire list response position must resolve to null. If the List type is also wrapped in a Non-Null, the execution error continues to propagate upwards.
+> If every response position from the root of the request to the source of the execution error has a Non-Null type, then the "data" entry in the execution result should be null.
+
+See [Handling Execution Errors](https://spec.graphql.org/September2025/#sec-Handling-Execution-Errors).
+
+Fixes https://github.com/graphql-hive/router/issues/1154
+
+Fixes https://github.com/graphql-hive/router/issues/1110
+
+#### Log subgraph subscription failures at error level
+
+Subgraph subscription failures (WebSocket handshake, HTTP-callback connect, SSE stream, etc.) are now logged at `error` level via the central `plan.rs` handler, matching how non-subscription subgraph errors are already logged. Previously these failures only reached the client; the router itself logged nothing above `debug`.
+
+#### Improve handling of unions
+
+The query planner improves handling of union types whose members vary between subgraphs. Previously, the planner always computed an intersection of union members, ignoring subgraph-specific members.
+
+Fixes [#1098](https://github.com/graphql-hive/router/issues/1098)
+
+#### Mark failed subgraph HTTP requests as errors on their trace span
+
+When an outgoing subgraph HTTP request failed at the transport level (connection error, timeout, body read failure, etc.), the `http.client` span was left with an unset `otel.status_code`, so the failure was not surfaced as an error in traces (e.g. Datadog). The error was only recorded in metrics. The span is now marked with `otel.status_code = "Error"` and the corresponding `error.type` on the failure path, matching the existing metrics behaviour.
+
+## 0.0.70 (2026-06-17)
+
+### Features
+
+#### Add an experimental query planner option, `experimental_abstract_type_folding`
+
+```yaml
+query_planner:
+    experimental_abstract_type_folding: true # false by default
+```
+
+Folds matching concrete object-type fragments in subgraph calls, into a shared interface fragment even when that interface is not the field's declared return type.
+
+It's an opt-in addition to [`011be5b`](https://github.com/graphql-hive/router/commit/011be5bdbfb00bf1e415eb7a50e6be91f565ef05).
+
+```diff
+## queries `product-service` subgraph
+query {
+  products {
+-    ... on Book  { id title }
+-    ... on Movie { id title }
++    ... on Media { id title }
+  }
+}
+```
+
+The `products` field returns `Product` interface, but one object-type member of this interface called `Album` is not present in the query, therefore `... on Product {...}` is not possible to use (default behavior). With the feature flag enabled, both fragments are folded into `... on Media { ... }`, because `Book` and `Movie` are the only members of the `Media` interface in the `product-service` subgraph.
+
+### Fixes
+
+#### Fix Router's HTTP layer timeout
+
+Hive Router has it's own timeout that's being enforced, but `ntex`'s one was still effective and uses the default settings.  
+
+Instead of fully disabling the low-level timeout, this PR changes the Router implementation to configure `ntex` timeout to `router_timeout+1` so the safe guard is still in place.
+
+#### Fix response header propagation on error paths
+
+Response header rules now run consistently for successful responses, partial GraphQL error responses, deduped requests, and execution failures.
+
+#### Avoid indirect lookup for directly resolved leaf fields
+
+The planner now skips indirect path lookup when a leaf field already has a valid direct path.
+
+## 0.0.69 (2026-06-16)
+
+### Fixes
+
+#### Fix union list FieldMove creation
+
+In some cases union list was treated as single union field in graph.
+
 ## 0.0.68 (2026-06-15)
 
 ### Features

@@ -5,6 +5,7 @@ use crate::executors::dedupe::unique_leader_fingerprint;
 use crate::executors::map::InflightRequestsMap;
 use crate::executors::multipart_subscribe;
 use crate::executors::sse;
+use crate::executors::subscription_buffer;
 use crate::hooks::on_subgraph_http_request::{
     OnSubgraphHttpRequestHookPayload, OnSubgraphHttpResponseHookPayload,
 };
@@ -257,20 +258,22 @@ async fn send_request<'a>(
         );
 
         let (parts, body) = res.into_parts();
-        let body = body
-            .collect()
-            .await
-            .map_err(|err| {
-                SubgraphExecutorError::ResponseBodyReadFailure(
+
+        let body = match body.collect().await {
+            Ok(body) => body.to_bytes(),
+            Err(err) => {
+                return Err(SubgraphExecutorError::ResponseBodyReadFailure(
                     endpoint.to_string(),
                     err.to_string(),
-                )
-            })?
-            .to_bytes();
+                    parts.headers.into(),
+                ));
+            }
+        };
 
         if body.is_empty() {
             return Err(SubgraphExecutorError::EmptyResponseBody(
                 subgraph_name.to_string(),
+                parts.headers.into(),
             ));
         }
 
@@ -292,6 +295,7 @@ async fn send_request<'a>(
             transport_duration,
         }),
         Err(err) => {
+            http_request_span.record_error(err.error_code());
             http_request_capture.finish_error(err.error_code(), transport_duration);
             Err(err)
         }
@@ -514,6 +518,7 @@ impl SubgraphExecutor for HTTPSubgraphExecutor {
         SubgraphExecutorError,
     > {
         let custom_scalar_paths = execution_request.custom_scalar_paths.cloned();
+        let buffer_capacity = self.config.subscriptions.subgraph_buffer_capacity;
         let body = build_request_body(&execution_request)?;
 
         let mut req = hyper::Request::builder()
@@ -593,7 +598,7 @@ impl SubgraphExecutor for HTTPSubgraphExecutor {
                 custom_scalar_paths.clone(),
             );
 
-            Ok(Box::pin(async_stream::stream! {
+            let mapped = Box::pin(async_stream::stream! {
                 trace!("multipart subscription stream started");
                 for await result in stream {
                     match result {
@@ -607,7 +612,16 @@ impl SubgraphExecutor for HTTPSubgraphExecutor {
                         }
                     }
                 }
-            }))
+            });
+
+            // buffer decouples the emitting subgraph from slow downstream consumers, dropping
+            // messages under backpressure instead of throttling the subgraph
+            Ok(subscription_buffer::buffered(
+                mapped,
+                buffer_capacity,
+                self.subgraph_name.clone(),
+                self.endpoint.to_string(),
+            ))
         } else {
             debug!(
                 "using SSE for subscription connection to subgraph {} at {}",
@@ -617,7 +631,7 @@ impl SubgraphExecutor for HTTPSubgraphExecutor {
 
             let stream = sse::parse_to_stream(body_stream, custom_scalar_paths.clone());
 
-            Ok(Box::pin(async_stream::stream! {
+            let mapped = Box::pin(async_stream::stream! {
                 trace!("SSE subscription stream started");
                 for await result in stream {
                     match result {
@@ -631,7 +645,16 @@ impl SubgraphExecutor for HTTPSubgraphExecutor {
                         }
                     }
                 }
-            }))
+            });
+
+            // buffer decouples the emitting subgraph from slow downstream consumers, dropping
+            // messages under backpressure instead of throttling the subgraph
+            Ok(subscription_buffer::buffered(
+                mapped,
+                buffer_capacity,
+                self.subgraph_name.clone(),
+                self.endpoint.to_string(),
+            ))
         }
     }
 }
@@ -674,13 +697,18 @@ impl SubgraphHttpResponse {
         self,
         custom_scalar_paths: Option<&CustomScalarPaths>,
     ) -> Result<SubgraphResponse<'static>, SubgraphExecutorError> {
-        SubgraphResponse::deserialize_from_bytes(self.body, custom_scalar_paths).map(
-            |mut resp: SubgraphResponse| {
-                resp.headers = Some(self.headers);
+        SubgraphResponse::deserialize_from_bytes(self.body, custom_scalar_paths)
+            .map(|mut resp: SubgraphResponse| {
+                resp.headers = Some(self.headers.clone());
                 resp.status = Some(self.status);
                 resp
-            },
-        )
+            })
+            .map_err(|e| match e {
+                SubgraphExecutorError::ResponseDeserializationFailure(err, _) => {
+                    SubgraphExecutorError::ResponseDeserializationFailure(err, Some(self.headers))
+                }
+                other => other,
+            })
     }
 }
 

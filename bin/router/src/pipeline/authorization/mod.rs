@@ -131,6 +131,7 @@ pub fn enforce_operation_authorization(
                         .operation_for_introspection
                         .clone(),
                     operation_for_introspection_hash: hashes.operation_for_introspection_hash,
+                    uses_semantic_introspection: normalized_payload.uses_semantic_introspection,
                     normalized_operation_hash: hashes.combined_operation_hash,
                     root_type_name: normalized_payload.root_type_name,
                     projection_plan: Arc::new(new_projection_plan),

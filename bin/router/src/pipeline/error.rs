@@ -138,6 +138,9 @@ pub enum PipelineError {
     #[error("Introspection queries are disabled")]
     #[strum(serialize = "INTROSPECTION_DISABLED")]
     IntrospectionDisabled,
+    #[error("Semantic introspection is disabled")]
+    #[strum(serialize = "SEMANTIC_INTROSPECTION_DISABLED")]
+    SemanticIntrospectionDisabled,
 
     // Subscription-related errors
     #[error("Subscriptions are not supported")]
@@ -283,6 +286,7 @@ impl PipelineError {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
             (Self::IntrospectionDisabled, _) => StatusCode::FORBIDDEN,
+            (Self::SemanticIntrospectionDisabled, _) => StatusCode::FORBIDDEN,
             (Self::SubscriptionsNotSupported, _) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             (Self::SubscriptionsTransportNotSupported, _) => StatusCode::NOT_ACCEPTABLE,
             (Self::ReadBodyStreamError(err), _) => err.status_code(),

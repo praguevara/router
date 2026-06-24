@@ -13,6 +13,7 @@ use hive_router_plan_executor::execution::plan::{
     execute_query_plan, CoerceVariablesPayload, ExecutionResultExtensions, PlanExecutionOutput,
     QueryPlanExecutionOpts, QueryPlanExecutionResult,
 };
+use hive_router_plan_executor::headers::response::ResponseHeaderSink;
 use hive_router_plan_executor::hooks::on_supergraph_load::SupergraphData;
 use hive_router_plan_executor::introspection::resolve::IntrospectionContext;
 use hive_router_plan_executor::plugin_context::PluginRequestState;
@@ -47,6 +48,7 @@ pub async fn execute_plan<'exec>(
     app_state: &RouterSharedState,
     planned_request: PlannedRequest<'exec>,
     span: GraphQLOperationSpan,
+    response_header_sink: ResponseHeaderSink,
 ) -> Result<QueryPlanExecutionResult, PipelineError> {
     let execute_span = GraphQLExecuteSpan::new();
     let introspection_context = IntrospectionContext {
@@ -56,6 +58,8 @@ pub async fn execute_plan<'exec>(
             .clone(),
         schema: Arc::clone(&supergraph.planner.consumer_schema.document),
         metadata: Arc::clone(&supergraph.metadata),
+        index: Arc::clone(&supergraph.semantic_index),
+        variables: planned_request.variable_payload.clone(),
     };
     async {
         let mut extensions = ExecutionResultExtensions::default();
@@ -145,6 +149,7 @@ pub async fn execute_plan<'exec>(
                 supergraph.operation_name_forward_config.clone(),
                 operation_name,
             ),
+            response_header_sink,
         })
         .await?;
 

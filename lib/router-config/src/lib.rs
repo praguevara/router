@@ -16,6 +16,7 @@ pub mod override_subgraph_urls;
 pub mod persisted_documents;
 pub mod primitives;
 pub mod query_planner;
+pub mod semantic_introspection;
 pub mod storage;
 pub mod subscriptions;
 pub mod supergraph;
@@ -117,6 +118,10 @@ pub struct HiveRouterConfig {
     /// Configuration to enable or disable introspection queries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub introspection: Option<IntrospectionPermissionConfig>,
+
+    /// Configuration for semantic introspection (`__search` / `__definitions`).
+    #[serde(default)]
+    pub semantic_introspection: semantic_introspection::SemanticIntrospectionConfig,
 
     #[serde(default)]
     pub telemetry: telemetry::TelemetryConfig,

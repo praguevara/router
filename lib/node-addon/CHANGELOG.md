@@ -1,4 +1,54 @@
 # @graphql-hive/router-query-planner changelog
+## 0.0.34 (2026-06-18)
+
+### Fixes
+
+#### Improve handling of unions
+
+The query planner improves handling of union types whose members vary between subgraphs. Previously, the planner always computed an intersection of union members, ignoring subgraph-specific members.
+
+Fixes [#1098](https://github.com/graphql-hive/router/issues/1098)
+
+## 0.0.33 (2026-06-17)
+
+### Fixes
+
+#### Add an experimental query planner option, `experimental_abstract_type_folding`
+
+```yaml
+query_planner:
+    experimental_abstract_type_folding: true # false by default
+```
+
+Folds matching concrete object-type fragments in subgraph calls, into a shared interface fragment even when that interface is not the field's declared return type.
+
+It's an opt-in addition to [`011be5b`](https://github.com/graphql-hive/router/commit/011be5bdbfb00bf1e415eb7a50e6be91f565ef05).
+
+```diff
+## queries `product-service` subgraph
+query {
+  products {
+-    ... on Book  { id title }
+-    ... on Movie { id title }
++    ... on Media { id title }
+  }
+}
+```
+
+The `products` field returns `Product` interface, but one object-type member of this interface called `Album` is not present in the query, therefore `... on Product {...}` is not possible to use (default behavior). With the feature flag enabled, both fragments are folded into `... on Media { ... }`, because `Book` and `Movie` are the only members of the `Media` interface in the `product-service` subgraph.
+
+#### Avoid indirect lookup for directly resolved leaf fields
+
+The planner now skips indirect path lookup when a leaf field already has a valid direct path.
+
+## 0.0.32 (2026-06-16)
+
+### Fixes
+
+#### Fix union list FieldMove creation
+
+In some cases union list was treated as single union field in graph.
+
 ## 0.0.31 (2026-06-15)
 
 ### Fixes

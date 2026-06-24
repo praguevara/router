@@ -20,9 +20,9 @@
 |[**override\_subgraph\_urls**](#override_subgraph_urls)|`object`|Configuration for overriding subgraph URLs.<br/>Default: `{}`<br/>||
 |[**persisted\_documents**](#persisted_documents)|`object`|Configuration for persisted documents extraction and resolution.<br/>Default: `{"enabled":false,"log_missing_id":false,"require_id":false,"selectors":null,"storage":null}`<br/>||
 |[**plugins**](#plugins)|`object`|Configuration for custom plugins<br/>||
-|[**query\_planner**](#query_planner)|`object`|Query planning configuration.<br/>Default: `{"allow_expose":false,"timeout":"10s"}`<br/>||
+|[**query\_planner**](#query_planner)|`object`|Query planning configuration.<br/>Default: `{"allow_expose":false,"experimental_abstract_type_folding":false,"timeout":"10s"}`<br/>||
 |[**storages**](#storages)|`object`|Configuration for storage sources.<br/>||
-|[**subscriptions**](#subscriptions)|`object`|Configuration for subscriptions.<br/>Default: `{"broadcast_capacity":0,"enabled":false}`<br/>||
+|[**subscriptions**](#subscriptions)|`object`|Configuration for subscriptions.<br/>Default: `{"broadcast_capacity":0,"enabled":false,"subgraph_buffer_capacity":0}`<br/>||
 |[**supergraph**](#supergraph)|`object`|Configuration for the Federation supergraph source. By default, the router will use a local file-based supergraph source (`./supergraph.graphql`).<br/>||
 |[**telemetry**](#telemetry)|`object`|Default: `{"client_identification":{"ip_header":null,"name_header":"graphql-client-name","version_header":"graphql-client-version"},"hive":null,"metrics":{"exporters":[],"instrumentation":{"common":{"histogram":{"aggregation":"explicit","bytes":{"buckets":[128,512,1024,2048,4096,8192,16384,32768,65536,131072,262144,524288,1048576,2097152,3145728,4194304,5242880],"record_min_max":false},"seconds":{"buckets":[0.005,0.01,0.025,0.05,0.075,0.1,0.25,0.5,0.75,1,2.5,5,7.5,10],"record_min_max":false}}},"instruments":{}}},"resource":{"attributes":{}},"tracing":{"collect":{"max_attributes_per_event":16,"max_attributes_per_link":32,"max_attributes_per_span":128,"max_events_per_span":128,"parent_based_sampler":false,"sampling":1},"exporters":[],"instrumentation":{"spans":{"mode":"spec_compliant"}},"propagation":{"b3":false,"baggage":false,"jaeger":false,"trace_context":true}}}`<br/>||
 |[**traffic\_shaping**](#traffic_shaping)|`object`|Configuration for the traffic-shaping of the executor. Use these configurations to control how requests are being executed to subgraphs.<br/>Default: `{"all":{"allow_only_http2":false,"circuit_breaker":null,"dedupe_enabled":true,"forward_operation_name":false,"pool_idle_timeout":"50s","request_timeout":"30s"},"max_connections_per_host":100,"router":{"dedupe":{"enabled":false,"headers":"all"},"max_long_lived_clients":128,"request_timeout":"1m"}}`<br/>||
@@ -133,11 +133,13 @@ persisted_documents:
 plugins: {}
 query_planner:
   allow_expose: false
+  experimental_abstract_type_folding: false
   timeout: 10s
 storages: {}
 subscriptions:
   broadcast_capacity: 0
   enabled: false
+  subgraph_buffer_capacity: 0
 supergraph: {}
 telemetry:
   client_identification:
@@ -2526,6 +2528,7 @@ Query planning configuration.
 |Name|Type|Description|Required|
 |----|----|-----------|--------|
 |**allow\_expose**|`boolean`|A flag to allow exposing the query plan in the response.<br/>When set to `true` and an incoming request has a `hive-expose-query-plan: true` header, the query plan will be exposed in the response, as part of `extensions`.<br/>Default: `false`<br/>||
+|**experimental\_abstract\_type\_folding**|`boolean`|Enables an experimental feature that folds matching object-type inline fragments<br/>into an interface fragment, even when that interface is not the field's declared return type.<br/><br/>The fold is only applied when the concrete object branches select the same fields and<br/>exactly match the interface members in the target subgraph.<br/><br/>Can also be set via the `QUERY_PLANNER_EXPERIMENTAL_ABSTRACT_TYPE_FOLDING` environment variable.<br/><br/>Default: false.<br/>Default: `false`<br/>||
 |**timeout**|`string`|The maximum time for the query planner to create an execution plan.<br/>This acts as a safeguard against overly complex or malicious queries that could degrade server performance.<br/>When the timeout is reached, the planning process is cancelled.<br/><br/>Default: 10s.<br/>Default: `"10s"`<br/>||
 
 **Additional Properties:** not allowed  
@@ -2533,6 +2536,7 @@ Query planning configuration.
 
 ```yaml
 allow_expose: false
+experimental_abstract_type_folding: false
 timeout: 10s
 
 ```
@@ -2573,6 +2577,7 @@ Configuration for subscriptions.
 |**broadcast\_capacity**|`integer`|The capacity of the broadcast channel used to fan out subscription events to all active listeners.<br/><br/>Each active subscription has its own broadcast channel. This value controls how many events<br/>can be buffered in that channel before slow consumers start lagging. If a consumer falls too<br/>far behind and the buffer is full, it will skip the missed messages and continue from the<br/>latest available event.<br/><br/>Subscription events are typically low-frequency, so the default of 32 is sufficient for most<br/>use cases. Increase this value if you expect bursts of events or have slow consumers that<br/>need more headroom to catch up.<br/><br/>Defaults to 32.<br/>Default: `32`<br/>Format: `"uint"`<br/>Minimum: `0`<br/>||
 |[**callback**](#subscriptionscallback)|`object`, `null`|Configuration for subgraphs using the HTTP Callback protocol.<br/>|yes|
 |**enabled**|`boolean`|Enables/disables subscriptions. By default, the subscriptions are disabled.<br/><br/>You can override this setting by setting the `SUBSCRIPTIONS_ENABLED` environment variable to `true` or `false`.<br/>Default: `false`<br/>||
+|**subgraph\_buffer\_capacity**|`integer`|The capacity of the per-subscription buffer between a subgraph and the router's<br/>processing pipeline.<br/><br/>When a subscription is established, the router reads events from the subgraph (over<br/>HTTP streaming or WebSocket) and runs each one through entity resolution before fanning<br/>it out to listeners. If that processing is slower than the rate at which the subgraph<br/>emits events, this buffer absorbs the difference so the subgraph is never throttled by<br/>the router's processing speed.<br/><br/>When the buffer is full, the newest event is dropped (and logged) instead of slowing<br/>down or tearing down the connection to the subgraph. The subscription stays alive and<br/>the subgraph keeps emitting unaffected.<br/><br/>A larger capacity gives the router more headroom to catch up during bursts at the cost<br/>of memory and potentially staler events under sustained backpressure. A smaller capacity<br/>keeps memory minimal and drops eagerly, which is appropriate when only the latest events<br/>matter.<br/><br/>Defaults to 1024.<br/>Default: `1024`<br/>Format: `"uint"`<br/>Minimum: `0`<br/>||
 |[**websocket**](#subscriptionswebsocket)|`object`, `null`|Configuration for subgraphs using WebSocket protocol.<br/>||
 
 **Additional Properties:** not allowed  
@@ -2581,6 +2586,7 @@ Configuration for subscriptions.
 ```yaml
 broadcast_capacity: 0
 enabled: false
+subgraph_buffer_capacity: 0
 
 ```
 
@@ -2597,7 +2603,7 @@ Configuration for subgraphs using the HTTP Callback protocol.
 |**heartbeat\_interval**|`string`|The interval at which the subgraph must send heartbeat messages.<br/>If set to 0, heartbeats are disabled. Defaults to 5 seconds.<br/>Default: `"5s"`<br/>|no|
 |**listen**|`string`, `null`|The IP address and port the router will listen on for subscription callbacks.<br/>When set, the router will start a dedicated HTTP server bound to this address<br/>for receiving callback messages from subgraphs, separate from the main GraphQL server.<br/>When not set, the callback handler is registered on the main server.<br/><br/>Example: `0.0.0.0:4001`<br/>|no|
 |**path**|`string`|The path of the router's callback endpoint.<br/>Must be an absolute path starting with `/`. Defaults to `/callback`.<br/>Default: `"/callback"`<br/>Pattern: `^/`<br/>|no|
-|**public\_url**|`string`|The public URL that subgraphs will use to send callback messages to this router.<br/><br/>Your public_url must match the server address combined with the router's path.<br/>Meaning, if your server is `http://localhost:4000` and the path is `/callback`,<br/>your `public_url` should be `http://localhost:4000/callback`.<br/><br/>Example: `https://example.com:4000/callback`<br/>Format: `"uri"`<br/>|yes|
+|**public\_url**||The public URL that subgraphs will use to send callback messages to this router.<br/><br/>Your public_url must match the server address combined with the router's path.<br/>Meaning, if your server is `http://localhost:4000` and the path is `/callback`,<br/>your `public_url` should be `http://localhost:4000/callback`.<br/><br/>Can be a static URL string or a VRL expression. Expressions are useful for<br/>service discovery in horizontally scaled deployments where the URL can be<br/>read from an environment variable:<br/><br/>```yaml<br/>public_url:<br/>  expression: 'env("ROUTER_PUBLIC_URL")'<br/>```<br/>|yes|
 |[**subgraphs**](#subscriptionscallbacksubgraphs)|`string[]`|The list of subgraph names that use the HTTP callback protocol.<br/>Default: <br/>|no|
 
 **Additional Properties:** not allowed  

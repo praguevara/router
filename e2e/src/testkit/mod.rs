@@ -12,6 +12,7 @@ use mockito::Mock;
 use ntex::{
     client::ClientResponse,
     io::Sealed,
+    time::Seconds,
     web::{self, test},
     ws::WsConnection,
 };
@@ -25,7 +26,10 @@ use std::{
     marker::PhantomData,
     net::SocketAddr,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tempfile::{NamedTempFile, TempPath};
@@ -306,6 +310,7 @@ struct TestSubgraphsHandle {
     server_handle: Handle<SocketAddr>,
     addr: SocketAddr,
     state: Arc<TestSubgraphsMiddlewareState>,
+    active_subscriptions: Arc<AtomicUsize>,
 }
 
 pub struct TestSubgraphs<State> {
@@ -405,7 +410,7 @@ impl TestSubgraphs<Built> {
         let addr = listener.local_addr().expect("failed to get local address");
         drop(listener); // release the listener; the axum_server will bind to the same addr
 
-        let mut app = subgraphs_app(self.subscriptions_protocol.clone());
+        let (mut app, active_subscriptions) = subgraphs_app(self.subscriptions_protocol.clone());
 
         let middleware_state = Arc::new(TestSubgraphsMiddlewareState {
             request_log: DashMap::new(),
@@ -472,6 +477,7 @@ impl TestSubgraphs<Built> {
                 server_handle,
                 addr,
                 state: middleware_state,
+                active_subscriptions,
             }),
             _state: PhantomData,
         }
@@ -488,6 +494,15 @@ impl TestSubgraphs<Started> {
             "http"
         };
         format!("{}://{}", protocol, addr)
+    }
+
+    /// Returns the number of currently active subscriptions on the reviews subgraph.
+    pub fn active_subscriptions(&self) -> usize {
+        self.handle
+            .as_ref()
+            .expect("subgraphs not started")
+            .active_subscriptions
+            .load(Ordering::SeqCst)
     }
 
     /// Returns the list of requests received on the given subgraph. Supply the subgarph name.
@@ -834,7 +849,17 @@ impl TestRouter<Built> {
         let serv_paths = paths.clone();
         let serv_prometheus = prometheus.clone();
         let long_lived_limit = LongLivedClientLimitService::new(&shared_state.router_config);
-        let mut serv_config = test::config().listener(serv_listener);
+        let mut serv_config = test::config()
+            .client_timeout(Seconds(
+                shared_state
+                    .router_config
+                    .traffic_shaping
+                    .router
+                    .request_timeout
+                    .as_secs() as u16
+                    + 1,
+            ))
+            .listener(serv_listener);
         if let Some(tls_config) = serv_shared_state
             .router_config
             .traffic_shaping
@@ -846,6 +871,7 @@ impl TestRouter<Built> {
                 .expect("failed to build rustls config for test router");
             serv_config = serv_config.rustls(rustls_config);
         }
+
         let serv = test::server_with(serv_config, move || {
             let shared_state = serv_shared_state.clone();
             let schema_state = serv_schema_state.clone();

@@ -14,6 +14,7 @@ mod utils;
 
 use std::ops::ControlFlow;
 use std::sync::Arc;
+use tracing::error;
 
 use crate::{
     consts::ROUTER_VERSION,
@@ -70,13 +71,25 @@ use hive_router_internal::{
 };
 pub use hive_router_plan_executor::execution::plan::PlanExecutionOutput;
 pub use hive_router_plan_executor::executors::http::SubgraphHttpResponse;
+use hive_router_plan_executor::headers::response::ResponseHeaderSink;
+// Semantic-introspection search backend, re-exported so downstream plugins can
+// implement and install a custom `SemanticSearchProvider` (e.g. via the
+// `on_supergraph_reload` hook) and reuse `PathIndex` for `paths_to_root`.
+pub use hive_router_plan_executor::introspection::semantic::{
+    Bm25Provider, PathIndex, SearchHit, SearchOptions, SemanticSearchProvider,
+};
 pub use hive_router_plan_executor::response::graphql_error::GraphQLError;
 pub use hive_router_query_planner as query_planner;
 pub use http;
 pub use mimalloc::MiMalloc as RouterGlobalAllocator;
 pub use ntex;
 pub use ntex::main;
-use ntex::web::{self, HttpRequest};
+use ntex::{
+    http::HttpServiceConfig,
+    time::Seconds,
+    web::{self, HttpRequest},
+    SharedCfg,
+};
 pub use sonic_rs;
 pub use tokio;
 pub use tracing;
@@ -168,6 +181,8 @@ async fn graphql_endpoint_dispatch(
     );
     let _ = root_http_request_span.set_parent(parent_ctx);
 
+    let response_header_sink = ResponseHeaderSink::default();
+
     async {
         // Set it to the default value in case of the negotiation failing,
         // so that we can still generate an error response in the correct format.
@@ -182,6 +197,7 @@ async fn graphql_endpoint_dispatch(
             schema_state.get_ref(),
             &root_http_request_span,
             &mut response_mode,
+            response_header_sink.clone(),
         );
 
         // Handle the request with a timeout. If the timeout is reached, a timeout error response will be generated.
@@ -194,6 +210,13 @@ async fn graphql_endpoint_dispatch(
                 handle_pipeline_error(err, request, &app_state, &response_mode)
             }
         };
+
+        if let Err(err) = response_header_sink
+            .take()
+            .modify_client_response_headers(response.headers_mut())
+        {
+            error!(error = %err, "Failed to apply response header rules to the outgoing client response");
+        }
 
         // Apply CORS headers to the final response if CORS is configured.
         if let Some(cors) = app_state.cors_runtime.as_ref() {
@@ -335,10 +358,29 @@ pub async fn router_entrypoint(plugin_registry: PluginRegistry) -> Result<(), Ro
                 landing_page_handler(landing_page_path.clone())
             }))
     });
+
     if let Some(workers) = workers {
         info!("configuring HTTP server with {} worker(s)", workers);
         server = server.workers(workers.get());
     }
+
+    let ntex_timeout = u16::try_from(
+        shared_state_clone
+            .router_config
+            .traffic_shaping
+            .router
+            .request_timeout
+            .as_secs()
+            .saturating_add(1),
+    )
+    .unwrap_or(u16::MAX);
+
+    let http_cfg = HttpServiceConfig::new()
+        // ntex HTTP timeout is set as a safe-guard on top of Hive Router's timeout
+        .set_client_timeout(Seconds(ntex_timeout));
+    let cfg = SharedCfg::new("HIVE_ROUTER").add(http_cfg);
+
+    server = server.config(cfg);
 
     let tls_config = shared_state_clone
         .router_config

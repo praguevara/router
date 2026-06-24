@@ -28,7 +28,26 @@ scalar String
 type Query {
   __schema: __Schema!
   __type(name: String!): __Type
+  __search(query: String!, first: Int! = 10, after: String, minScore: Float): [__SearchResult!]!
+  __definitions(coordinates: [String!]!): [__SchemaDefinition!]!
 }
+
+"A single semantic-introspection search hit, identifying a schema member relevant to the query."
+type __SearchResult {
+  "Schema coordinate of the match, e.g. \"Area.availableTaxis\"."
+  coordinate: String!
+  "The matched definition (type, field, argument, enum value, or directive)."
+  definition: __SchemaDefinition!
+  "Field-coordinate paths from a root type to the match, e.g. [[\"Query.areaByName\", \"Area.availableTaxis\"]]."
+  pathsToRoot: [[String!]!]!
+  "Relevance score in the range [0, 1]; results are ordered by score descending."
+  score: Float
+  "Opaque cursor for pagination via the `after` argument."
+  cursor: String!
+}
+
+"A schema member returned by semantic introspection."
+union __SchemaDefinition = __Type | __Field | __InputValue | __EnumValue | __Directive
 
 type __Schema {
   description: String

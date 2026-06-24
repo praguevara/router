@@ -66,6 +66,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - *(hive-router)* fix docker image issues  ([#394](https://github.com/graphql-hive/router/pull/394))
+## 0.1.4 (2026-06-19)
+
+### Features
+
+#### Make the subscription subgraph executor buffer capacity configurable
+
+When a subscription is established, the router reads events from the subgraph (over HTTP streaming or WebSocket) and runs each one through entity resolution before fanning it out to listeners. A per-subscription buffer sits between the subgraph and that processing pipeline so the subgraph is never throttled when the router falls behind. When the buffer is full, the newest incoming event is dropped (and logged) instead of slowing down or tearing down the connection to the subgraph.
+
+The size of this buffer is now configurable via `subscriptions.subgraph_buffer_capacity`. A larger capacity gives the router more headroom to absorb bursts at the cost of memory and potentially staler events under sustained backpressure; a smaller capacity keeps memory minimal and drops eagerly. It defaults to `1024`, favoring high throughput.
+
+```yaml
+subscriptions:
+  enabled: true
+  subgraph_buffer_capacity: 1024 # default
+```
+
+## 0.1.3 (2026-06-17)
+
+### Features
+
+#### Add an experimental query planner option, `experimental_abstract_type_folding`
+
+```yaml
+query_planner:
+    experimental_abstract_type_folding: true # false by default
+```
+
+Folds matching concrete object-type fragments in subgraph calls, into a shared interface fragment even when that interface is not the field's declared return type.
+
+It's an opt-in addition to [`011be5b`](https://github.com/graphql-hive/router/commit/011be5bdbfb00bf1e415eb7a50e6be91f565ef05).
+
+```diff
+## queries `product-service` subgraph
+query {
+  products {
+-    ... on Book  { id title }
+-    ... on Movie { id title }
++    ... on Media { id title }
+  }
+}
+```
+
+The `products` field returns `Product` interface, but one object-type member of this interface called `Album` is not present in the query, therefore `... on Product {...}` is not possible to use (default behavior). With the feature flag enabled, both fragments are folded into `... on Media { ... }`, because `Book` and `Movie` are the only members of the `Media` interface in the `product-service` subgraph.
+
+## 0.1.2 (2026-06-16)
+
+### Features
+
+#### Support VRL expression for subscription callback `public_url`
+
+The `subscriptions.callback.public_url` config field now accepts either a static URL string or a VRL expression, in addition to the previously supported plain URL value.
+
+This is useful in horizontally scaled deployments where the public callback URL is not known at build time and must be resolved at runtime - for example, from an environment variable set by the orchestrator per instance.
+
+### Configuration
+
+```yaml
+subscriptions:
+  enabled: true
+  callback:
+    # static URL (existing behavior, unchanged)
+    public_url: "https://my-router.example.com/callback"
+    subgraphs:
+      - reviews
+```
+
+```yaml
+subscriptions:
+  enabled: true
+  callback:
+    # VRL expression - resolved at runtime
+    public_url:
+      expression: 'env("ROUTER_CALLBACK_PUBLIC_URL")'
+    subgraphs:
+      - reviews
+```
+
 ## 0.1.1 (2026-06-15)
 
 ### Features

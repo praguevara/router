@@ -23,14 +23,16 @@ use hive_router_plan_executor::{
         OnSupergraphLoadEndHookPayload, OnSupergraphLoadStartHookPayload, PublicSchema,
         SupergraphData,
     },
-    introspection::schema::SchemaWithMetadata,
+    introspection::{
+        schema::SchemaWithMetadata,
+        semantic::{Bm25Provider, SemanticSearchProvider},
+    },
     plugin_trait::{EndControlFlow, RouterPluginBoxed, StartControlFlow},
     response::graphql_error::GraphQLError,
     SubgraphExecutorMap,
 };
-use hive_router_query_planner::planner::plan_nodes::QueryPlan;
 use hive_router_query_planner::{
-    planner::{Planner, PlannerError},
+    planner::{plan_nodes::QueryPlan, Planner, PlannerError, QueryPlannerOptions},
     utils::parsing::safe_parse_schema,
 };
 use moka::future::Cache;
@@ -280,8 +282,19 @@ impl SchemaState {
         parsed_supergraph_sdl: Document,
         callback_subscriptions: CallbackSubscriptionsMap,
     ) -> Result<SupergraphData, SupergraphManagerError> {
-        let planner = Planner::new_from_supergraph(&parsed_supergraph_sdl)?;
+        let planner = Planner::new_from_supergraph(
+            &parsed_supergraph_sdl,
+            QueryPlannerOptions {
+                experimental_abstract_type_folding: router_config
+                    .query_planner
+                    .experimental_abstract_type_folding,
+            },
+        )?;
         let metadata = Arc::new(planner.consumer_schema.schema_metadata());
+        let semantic_index: Arc<dyn SemanticSearchProvider> = Arc::new(Bm25Provider::build(
+            &planner.consumer_schema.document,
+            &metadata,
+        ));
         let authorization = AuthorizationMetadata::build(&planner.supergraph, &metadata)?;
         let operation_name_forward_config = Arc::new(OperationNameForwardConfig::new(
             &router_config.traffic_shaping,
@@ -301,6 +314,7 @@ impl SchemaState {
                 sdl: Arc::<str>::from(planner.consumer_schema.document.to_string()),
             },
             metadata,
+            semantic_index,
             planner,
             authorization,
             subgraph_executor_map,
