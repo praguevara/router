@@ -37,6 +37,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, trace};
 
 use crate::executors::common::SubgraphExecutionRequest;
+use crate::executors::compression;
 use crate::executors::error::SubgraphExecutorError;
 use crate::utils::consts::CLOSE_BRACE;
 use crate::utils::consts::COLON;
@@ -52,6 +53,9 @@ pub struct HTTPSubgraphExecutor {
     pub endpoint: http::Uri,
     pub http_client: Arc<HttpClient>,
     pub header_map: HeaderMap,
+    /// When set, advertised to the subgraph via `Accept-Encoding`; the response body is then
+    /// decoded according to its `Content-Encoding`. `None` disables compression negotiation.
+    pub accept_encoding: Option<HeaderValue>,
     pub semaphore: Arc<Semaphore>,
     pub dedupe_enabled: bool,
     pub in_flight_requests: InflightRequestsMap,
@@ -161,6 +165,7 @@ impl HTTPSubgraphExecutor {
         subgraph_name: String,
         endpoint: http::Uri,
         http_client: Arc<HttpClient>,
+        accept_encoding: Option<HeaderValue>,
         semaphore: Arc<Semaphore>,
         dedupe_enabled: bool,
         in_flight_requests: InflightRequestsMap,
@@ -182,6 +187,7 @@ impl HTTPSubgraphExecutor {
             endpoint,
             http_client,
             header_map,
+            accept_encoding,
             semaphore,
             dedupe_enabled,
             in_flight_requests,
@@ -199,6 +205,8 @@ pub struct SendRequestOpts<'a> {
     pub body: Vec<u8>,
     pub headers: HeaderMap,
     pub timeout: Option<Duration>,
+    /// When true, decode the response body according to its `Content-Encoding` header.
+    pub decompress: bool,
     pub telemetry_context: &'a Arc<TelemetryContext>,
 }
 
@@ -213,6 +221,7 @@ async fn send_request<'a>(
         body,
         headers,
         timeout,
+        decompress,
         telemetry_context,
     } = opts;
     let request_body_size = body.len() as u64;
@@ -257,7 +266,7 @@ async fn send_request<'a>(
             res.status()
         );
 
-        let (parts, body) = res.into_parts();
+        let (mut parts, body) = res.into_parts();
 
         let body = match body.collect().await {
             Ok(body) => body.to_bytes(),
@@ -268,6 +277,30 @@ async fn send_request<'a>(
                     parts.headers.into(),
                 ));
             }
+        };
+
+        let body = if decompress {
+            match compression::decompress_response(&parts.headers, body) {
+                Ok((decoded, was_decoded)) => {
+                    if was_decoded {
+                        // Body is now plaintext; drop stale framing headers so downstream
+                        // consumers (plugins, response processing) don't see them.
+                        parts.headers.remove(http::header::CONTENT_ENCODING);
+                        parts.headers.remove(http::header::CONTENT_LENGTH);
+                    }
+                    decoded
+                }
+                Err(err) => {
+                    return Err(SubgraphExecutorError::ResponseDecompressionFailure(
+                        subgraph_name.to_string(),
+                        err.encoding_label(),
+                        err.to_string(),
+                        Arc::new(parts.headers),
+                    ));
+                }
+            }
+        } else {
+            body
         };
 
         if body.is_empty() {
@@ -328,6 +361,11 @@ impl SubgraphExecutor for HTTPSubgraphExecutor {
         self.header_map.iter().for_each(|(key, value)| {
             execution_request.headers.insert(key, value.clone());
         });
+        if let Some(accept_encoding) = &self.accept_encoding {
+            execution_request
+                .headers
+                .insert(http::header::ACCEPT_ENCODING, accept_encoding.clone());
+        }
 
         let mut method = http::Method::POST;
         let mut deduplicate_request = !self.dedupe_enabled || !execution_request.dedupe;
@@ -384,6 +422,7 @@ impl SubgraphExecutor for HTTPSubgraphExecutor {
                     body,
                     headers: execution_request.headers,
                     timeout,
+                    decompress: self.accept_encoding.is_some(),
                     telemetry_context: &self.telemetry_context,
                 };
 

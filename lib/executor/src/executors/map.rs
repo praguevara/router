@@ -24,7 +24,7 @@ use hive_router_internal::{
     expressions::vrl::compiler::Program as VrlProgram, inflight::InFlightMap,
     telemetry::TelemetryContext,
 };
-use http::{StatusCode, Uri};
+use http::{HeaderValue, StatusCode, Uri};
 use hyper_util::{
     client::legacy::Client,
     rt::{TokioExecutor, TokioTimer},
@@ -38,6 +38,7 @@ use crate::{
     },
     executors::{
         common::{SubgraphExecutionRequest, SubgraphExecutor, SubgraphExecutorBoxedArc},
+        compression::accept_encoding_header_value,
         error::SubgraphExecutorError,
         http::{HTTPSubgraphExecutor, HttpClient, SubgraphHttpResponse},
         http_callback::{CallbackSubscriptionsMap, HttpCallbackSubgraphExecutor},
@@ -133,6 +134,9 @@ struct ResolvedSubgraphConfig<'a> {
     client: Arc<HttpClient>,
     timeout_config: &'a DurationOrExpression,
     dedupe_enabled: bool,
+    /// `Accept-Encoding` header advertised to the subgraph, or `None` when compression
+    /// negotiation is disabled for it.
+    accept_encoding: Option<HeaderValue>,
 }
 
 pub type InflightRequestsMap = InFlightMap<u64, (SubgraphHttpResponse, u64)>;
@@ -661,6 +665,7 @@ impl SubgraphExecutorMap {
                     subgraph_name.to_string(),
                     endpoint_uri,
                     subgraph_config.client,
+                    subgraph_config.accept_encoding,
                     semaphore,
                     subgraph_config.dedupe_enabled,
                     self.in_flight_requests.clone(),
@@ -829,6 +834,9 @@ impl SubgraphExecutorMap {
             client: self.client.clone(),
             timeout_config: &self.config.traffic_shaping.all.request_timeout,
             dedupe_enabled: self.config.traffic_shaping.all.dedupe_enabled,
+            accept_encoding: accept_encoding_header_value(
+                &self.config.traffic_shaping.all.accept_encoding,
+            ),
         };
 
         let Some(subgraph_config) = self.config.traffic_shaping.subgraphs.get(subgraph_name) else {
@@ -869,6 +877,10 @@ impl SubgraphExecutorMap {
 
         if let Some(custom_timeout) = &subgraph_config.request_timeout {
             config.timeout_config = custom_timeout;
+        }
+
+        if let Some(encodings) = &subgraph_config.accept_encoding {
+            config.accept_encoding = accept_encoding_header_value(encodings);
         }
 
         Ok(config)

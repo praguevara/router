@@ -116,6 +116,22 @@ pub struct TrafficShapingExecutorSubgraphConfig {
     /// This setting takes precedence over the value set in `all` section.
     #[serde(default)]
     pub forward_operation_name: Option<bool>,
+
+    /// Content encodings the router advertises to this subgraph via `Accept-Encoding`,
+    /// and will transparently decode from the subgraph's compressed responses.
+    ///
+    /// When set (non-empty), the router adds `Accept-Encoding: <list>` to requests sent
+    /// to this subgraph and decompresses the response body according to its
+    /// `Content-Encoding` header before parsing. When unset, the value from the `all`
+    /// section is used; when that is also empty, no `Accept-Encoding` is sent and
+    /// responses are treated as uncompressed (the default, unchanged behavior).
+    ///
+    /// Example:
+    /// ```yaml
+    ///   accept_encoding: [zstd, gzip]
+    /// ```
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accept_encoding: Option<Vec<SubgraphAcceptEncoding>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
@@ -181,6 +197,50 @@ pub struct TrafficShapingExecutorGlobalConfig {
     /// Format: <Client Operation Name>__<Fetch Node ID>
     #[serde(default)]
     pub forward_operation_name: bool,
+
+    /// Content encodings the router advertises to subgraphs via `Accept-Encoding`,
+    /// and will transparently decode from compressed subgraph responses.
+    ///
+    /// When non-empty, the router adds `Accept-Encoding: <list>` to every subgraph
+    /// request and decompresses the response body according to its `Content-Encoding`
+    /// header before parsing. Encodings are advertised in the given order. When empty
+    /// (the default), no `Accept-Encoding` is sent and responses are treated as
+    /// uncompressed - the previous behavior.
+    ///
+    /// Can be overridden per-subgraph in the `subgraphs` section.
+    ///
+    /// Example:
+    /// ```yaml
+    ///   accept_encoding: [zstd, gzip]
+    /// ```
+    #[serde(default)]
+    pub accept_encoding: Vec<SubgraphAcceptEncoding>,
+}
+
+/// A content encoding the router can request from and decode from subgraphs.
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SubgraphAcceptEncoding {
+    /// Zstandard (`Content-Encoding: zstd`).
+    Zstd,
+    /// gzip (`Content-Encoding: gzip`).
+    Gzip,
+    /// Brotli (`Content-Encoding: br`).
+    Br,
+    /// zlib/deflate (`Content-Encoding: deflate`).
+    Deflate,
+}
+
+impl SubgraphAcceptEncoding {
+    /// The HTTP token used in `Accept-Encoding` / `Content-Encoding` headers.
+    pub fn as_token(&self) -> &'static str {
+        match self {
+            SubgraphAcceptEncoding::Zstd => "zstd",
+            SubgraphAcceptEncoding::Gzip => "gzip",
+            SubgraphAcceptEncoding::Br => "br",
+            SubgraphAcceptEncoding::Deflate => "deflate",
+        }
+    }
 }
 
 fn default_subgraph_pool_idle_timeout() -> Option<Duration> {
@@ -215,6 +275,7 @@ impl Default for TrafficShapingExecutorGlobalConfig {
             tls: None,
             allow_only_http2: false,
             forward_operation_name: false,
+            accept_encoding: Vec::new(),
         }
     }
 }

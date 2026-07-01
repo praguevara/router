@@ -59,6 +59,9 @@ pub enum SubgraphExecutorError {
     #[error("Failed to deserialize subgraph response: {0}")]
     #[strum(serialize = "SUBGRAPH_RESPONSE_DESERIALIZATION_FAILURE")]
     ResponseDeserializationFailure(sonic_rs::Error, Option<Arc<HeaderMap>>),
+    #[error("Failed to decompress response from subgraph \"{0}\" (content-encoding '{1}'): {2}")]
+    #[strum(serialize = "SUBGRAPH_RESPONSE_DECOMPRESSION_FAILURE")]
+    ResponseDecompressionFailure(String, String, String, Arc<HeaderMap>),
     #[error(transparent)]
     #[strum(serialize = "SUBGRAPH_HTTPS_CERTS_FAILURE")]
     TlsCertificatesError(#[from] TlsCertificatesError),
@@ -131,6 +134,7 @@ impl SubgraphExecutorError {
             Self::EmptyResponseBody(_, headers) => Some(headers.as_ref()),
             Self::ResponseBodyReadFailure(_, _, headers) => Some(headers.as_ref()),
             Self::ResponseDeserializationFailure(_, headers) => headers.as_deref(),
+            Self::ResponseDecompressionFailure(_, _, _, headers) => Some(headers.as_ref()),
             _ => None,
         }
     }
